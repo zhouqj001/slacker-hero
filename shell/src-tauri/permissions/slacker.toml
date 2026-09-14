@@ -1,0 +1,72 @@
+# slacker-hero app command permissions.
+# Tauri v2 ACL: commands defined on the app itself are callable from LOCAL
+# frames by default, but the dsh runtime rides on a REMOTE origin
+# (http://127.0.0.1:<port> — fresh port each boot), where every invoke is
+# denied unless a capability grants an app permission that allows the
+# command. This file defines those permissions; capabilities/default.json
+# references them for the main + tea windows.
+
+[[permission]]
+identifier = "allow-slacker-shell"
+description = "Boot/read the dsh runtime (landing page rides the CLI static server origin http://127.0.0.1:1430 in tauri dev, which the ACL treats as remote)"
+commands.allow = ["shell_boot", "shell_url"]
+
+[[permission]]
+identifier = "allow-slacker-kv"
+description = "KV read/write backing the novel & settings persistence"
+commands.allow = ["slacker_kv_get", "slacker_kv_set"]
+
+[[permission]]
+identifier = "allow-slacker-novel"
+description = "Local novel shelf file management (save/list/toc/chapter/delete; chapter reads are seek-based for large TXT)"
+commands.allow = [
+  "slacker_novel_save",
+  "slacker_novel_list",
+  "slacker_novel_toc",
+  "slacker_novel_chapter",
+  "slacker_novel_load",
+  "slacker_novel_delete",
+  "slacker_novel_dir",
+  "slacker_novel_set_dir",
+  "slacker_novel_pick_dir",
+]
+
+[[permission]]
+identifier = "allow-slacker-stock"
+description = "Stock watchlist quotes/search/trends/kline + the mini desktop ticker window"
+commands.allow = ["slacker_stock_quotes", "slacker_stock_search", "slacker_stock_trends", "slacker_stock_kline", "slacker_stock_mini"]
+
+[[permission]]
+identifier = "allow-slacker-zhihu"
+description = "Thin proxy for the Zhihu recommendation feed (feed page/content/read-feedback/me validation; cookie supplied per-call by the tea room)"
+commands.allow = ["slacker_zhihu_feed", "slacker_zhihu_content", "slacker_zhihu_report_read", "slacker_zhihu_me"]
+
+[[permission]]
+identifier = "allow-slacker-http"
+description = "Proxied HTTP fetch for the novel book-source engine"
+commands.allow = ["slacker_http_fetch"]
+
+[[permission]]
+identifier = "allow-slacker-read"
+description = "Read an imported TXT file from disk for the novel shelf"
+commands.allow = ["slacker_read_text"]
+
+[[permission]]
+identifier = "allow-slacker-tea"
+description = "Open/close/minimize the standalone tea room window"
+commands.allow = ["slacker_tea_window"]
+
+[[permission]]
+identifier = "allow-slacker-novel-window"
+description = "Open/close the standalone novel reader window"
+commands.allow = ["slacker_novel_window"]
+
+[[permission]]
+identifier = "allow-slacker-novel-float"
+description = "Resize/reposition the novel window into a floating translucent strip (mouse passthrough)"
+commands.allow = ["slacker_novel_float", "slacker_novel_resize"]
+
+[[permission]]
+identifier = "allow-slacker-theme"
+description = "Return the cached dsh root CSS variables for standalone windows to match the theme"
+commands.allow = ["slacker_theme_get"]

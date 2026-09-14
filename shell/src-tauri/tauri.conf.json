@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "slacker-shell",
+  "version": "0.1.0",
+  "identifier": "com.slacker.shell",
+  "build": {
+    "frontendDist": "../ui",
+    "beforeDevCommand": "node scripts/standalone-assets.cjs",
+    "beforeBuildCommand": "node scripts/standalone-assets.cjs"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "浮生半日",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico"],
+    "resources": ["resources/*"]
+  }
+}

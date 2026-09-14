@@ -1,0 +1,524 @@
+/* 自选行情：卡片网格 + 分时 sparkline（色板变量继承自 .overlay/.overlayTea）。
+ * A 股惯例红涨绿跌：涨跌色在 .root 上固化为 --pa-up / --pa-down。 */
+
+.root {
+  --pa-up: #f25a5a;
+  --pa-down: #4ed17e;
+
+  align-self: stretch;
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: stockIn 0.22s ease both;
+}
+
+@keyframes stockIn {
+  from { opacity: 0; transform: translateY(8px); }
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.head b { font-size: 14.5px; }
+
+/* 实时角标：呼吸点 + 刷新周期 */
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: 10px ui-monospace, monospace;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--pa-text3);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--pa-bg3);
+  box-shadow: inset 0 0 0 1px var(--pa-line);
+}
+
+.dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--pa-lamp);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 var(--pa-glow); }
+  50% { opacity: 0.45; box-shadow: 0 0 6px 1px var(--pa-glow); }
+}
+
+.updated {
+  margin-left: auto;
+  font: 11px ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--pa-text3);
+}
+
+.refresh {
+  border: none;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 15px;
+  color: var(--pa-text2);
+  background: var(--pa-bg3);
+  box-shadow: inset 0 0 0 1px var(--pa-line);
+  transition: 0.15s;
+}
+
+.refresh:hover {
+  color: var(--pa-cream);
+  background: var(--pa-hover);
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 卡片网格：面板宽 680 → 两列；窄于 520 自动落回单列 */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px 0;
+  border-radius: 14px;
+  background: linear-gradient(165deg,
+    color-mix(in srgb, var(--pa-cream) 4%, var(--pa-bg2)),
+    var(--pa-bg2) 55%);
+  box-shadow: inset 0 0 0 1px var(--pa-line);
+  overflow: hidden;
+  transition: box-shadow 0.15s, transform 0.15s;
+  animation: cardIn 0.25s ease both;
+}
+
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(6px); }
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    inset 0 0 0 1px var(--pa-line2),
+    0 6px 18px -8px rgba(0, 0, 0, 0.45);
+}
+
+/* 按当日涨跌染卡片顶缘光：红涨绿跌 */
+.card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--pa-up), transparent);
+  opacity: 0.55;
+}
+
+.card.down::before {
+  background: linear-gradient(90deg, transparent, var(--pa-down), transparent);
+}
+
+.del {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  border: none;
+  background: none;
+  color: inherit;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  transition: 0.15s;
+}
+
+.card:hover .del { opacity: 0.4; }
+.card .del:hover { opacity: 0.9; }
+
+.top {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.name {
+  min-width: 0;
+}
+
+.name b {
+  display: block;
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 显式上色：卡片是 <button>，UA 默认 color(buttontext 近黑)不继承祖先，
+     漏写会让名字在深底上不可读；用强调色使其跟随「弹窗配色」fg 字段。 */
+  color: var(--pa-cream);
+}
+
+.name span {
+  display: block;
+  font: 10.5px ui-monospace, monospace;
+  letter-spacing: 0.05em;
+  color: var(--pa-text3);
+}
+
+/* 涨跌胶囊：pct 主、额副 */
+.chg {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  padding: 4px 10px;
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chg b { font-size: 12.5px; font-weight: 700; }
+
+.chg span {
+  font-size: 10px;
+  opacity: 0.72;
+}
+
+.chgUp {
+  background: color-mix(in srgb, var(--pa-up) 13%, transparent);
+  color: var(--pa-up);
+}
+
+.chgDown {
+  background: color-mix(in srgb, var(--pa-down) 13%, transparent);
+  color: var(--pa-down);
+}
+
+/* 大字价格：卡片主角 */
+.mid {
+  display: flex;
+  align-items: baseline;
+}
+
+.price {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--pa-cream);
+  letter-spacing: 0.01em;
+}
+
+/* 行情闪动：从涨/跌色淡回本色（只写 from，终点即元素自然色） */
+.flashUp { animation: flashUp 0.9s ease; }
+.flashDown { animation: flashDown 0.9s ease; }
+
+@keyframes flashUp {
+  from { color: var(--pa-up); text-shadow: 0 0 14px color-mix(in srgb, var(--pa-up) 45%, transparent); }
+}
+
+@keyframes flashDown {
+  from { color: var(--pa-down); text-shadow: 0 0 14px color-mix(in srgb, var(--pa-down) 45%, transparent); }
+}
+
+/* 分时 sparkline：贴卡片底缘、全宽出血 */
+.sparkBox {
+  margin: 2px -14px 0;
+  height: 42px;
+}
+
+.spark {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.sparkEmpty {
+  height: 100%;
+  background: linear-gradient(to top,
+    color-mix(in srgb, var(--pa-cream) 3%, transparent),
+    transparent 60%);
+}
+
+/* 首次加载骨架卡 */
+.skeleton {
+  pointer-events: none;
+  height: 128px;
+}
+
+.skName,
+.skPrice,
+.skSpark {
+  border-radius: 6px;
+  background: linear-gradient(100deg,
+    var(--pa-bg3) 40%,
+    color-mix(in srgb, var(--pa-cream) 7%, var(--pa-bg3)) 50%,
+    var(--pa-bg3) 60%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.skName { width: 108px; height: 26px; }
+
+.skPrice { width: 132px; height: 24px; }
+
+.skSpark {
+  margin: 2px -14px 0;
+  height: 42px;
+  border-radius: 0;
+}
+
+@keyframes shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -80% 0; }
+}
+
+.addRow {
+  display: flex;
+  gap: 8px;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  outline: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12.5px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--pa-line2);
+  transition: box-shadow 0.15s;
+}
+
+.input::placeholder { color: var(--pa-text3); }
+
+.input:focus {
+  box-shadow: inset 0 0 0 1px var(--pa-warmline);
+}
+
+.pill {
+  border: none;
+  border-radius: 999px;
+  padding: 5px 15px;
+  cursor: pointer;
+  font-size: 12.5px;
+  flex: none;
+  color: var(--pa-text2);
+  background: var(--pa-bg3);
+  box-shadow: inset 0 0 0 1px var(--pa-line);
+  transition: 0.15s;
+}
+
+.pill:hover {
+  color: var(--pa-cream);
+  background: var(--pa-soft);
+  box-shadow: inset 0 0 0 1px var(--pa-warmline-soft);
+}
+
+/* ── v2: search results, kline detail, active card ── */
+
+/* 搜索下拉：紧随输入行下方 */
+.results {
+  position: relative;
+  z-index: 5;
+  max-height: 240px;
+  overflow-y: auto;
+  border-radius: 12px;
+  background: var(--pa-bg2);
+  box-shadow:
+    inset 0 0 0 1px var(--pa-line2),
+    0 12px 28px -10px rgba(0, 0, 0, 0.5);
+  padding: 4px;
+}
+
+.resultRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: 0.15s;
+}
+
+.resultRow:hover {
+  background: var(--pa-hover);
+}
+
+.resultName {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.resultMeta {
+  font: 11px ui-monospace, monospace;
+  color: var(--pa-text3);
+  flex: none;
+}
+
+.resultAdded {
+  font-size: 10px;
+  flex: none;
+  color: var(--pa-text3);
+}
+
+.resultHint {
+  padding: 10px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--pa-text3);
+}
+
+/* 选中的卡片：高亮顶缘 + 底板 */
+.card.active {
+  box-shadow:
+    inset 0 0 0 1px var(--pa-warmline),
+    0 0 0 3px color-mix(in srgb, var(--pa-warmline) 18%, transparent);
+}
+
+/* K线详情面板 */
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 14px 12px;
+  border-radius: 14px;
+  background: linear-gradient(165deg,
+    color-mix(in srgb, var(--pa-cream) 4%, var(--pa-bg2)),
+    var(--pa-bg2) 55%);
+  box-shadow: inset 0 0 0 1px var(--pa-line);
+  animation: detailIn 0.22s ease both;
+}
+
+@keyframes detailIn {
+  from { opacity: 0; transform: translateY(6px); }
+}
+
+.detailHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.detailTitle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detailTitle b {
+  font-size: 15px;
+}
+
+.detailCode {
+  font: 11px ui-monospace, monospace;
+  color: var(--pa-text3);
+}
+
+.chgUpBare { color: var(--pa-up); }
+.chgDownBare { color: var(--pa-down); }
+
+.detailHead .pill { margin-left: auto; }
+
+.detailBars {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.barBtn {
+  border: none;
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--pa-text2);
+  background: var(--pa-bg3);
+  box-shadow: inset 0 0 0 1px var(--pa-line);
+  transition: 0.15s;
+}
+
+.barBtn:hover {
+  color: var(--pa-cream);
+  background: var(--pa-hover);
+}
+
+.barOn {
+  color: var(--pa-bg2);
+  background: var(--pa-warmline);
+  box-shadow: none;
+}
+
+.barOn:hover {
+  color: var(--pa-bg2);
+  background: var(--pa-warmline);
+}
+
+/* K线 SVG */
+.chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--pa-cream) 3%, transparent);
+}
+
+.chartEmpty {
+  padding: 18px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--pa-text3);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--pa-cream) 3%, transparent);
+}
+
+.cGrid {
+  stroke: color-mix(in srgb, var(--pa-line) 80%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+}
+
+.cPrice,
+.cTime {
+  font: 10px ui-monospace, monospace;
+  fill: var(--pa-text3);
+}
+
+.cPrice { font-variant-numeric: tabular-nums; }

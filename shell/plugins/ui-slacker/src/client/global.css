@@ -1,0 +1,34 @@
+/* 独立窗口全局样式：提供原 dsh design system 的 CSS 变量兜底值。 */
+:root {
+  /* 背景层级 */
+  --dsw-alias-bg-base: #17191f;
+  --dsw-alias-bg-layer-1: #1c1e25;
+  --dsw-alias-bg-layer-2: #212329;
+
+  /* 文字色 */
+  --dsw-alias-label-primary: #eef1f6;
+  --dsw-alias-label-secondary: #c3c9d4;
+  --dsw-alias-label-caption: #7e8593;
+
+  /* 边框 */
+  --dsw-alias-border-l1: rgba(255, 255, 255, 0.06);
+  --dsw-alias-border-l2: rgba(255, 255, 255, 0.12);
+
+  /* 交互态 */
+  --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.08);
+
+  /* 品牌色 */
+  --dsw-alias-state-business-primary: #4d6bfe;
+  --dsw-alias-button-info-hover: #3d58d8;
+}
+
+/* 基础重置 */
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); -webkit-font-smoothing: antialiased; }
+a { color: inherit; }
+button { font-family: inherit; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--dsw-alias-border-l2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--dsw-alias-label-caption); }

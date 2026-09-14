@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "types": ["node"],
+    "paths": {
+      "@slacker/novel": ["../../novel/src"],
+      "@slacker/novel/client": ["../../novel/src/client"],
+      "@slacker/novel/client/novel/NovelView": ["../../novel/src/client/novel/NovelView.tsx"],
+      "@slacker/novel/client/locales": ["../../novel/src/client/locales.ts"]
+    }
+  },
+  "include": ["src"]
+}

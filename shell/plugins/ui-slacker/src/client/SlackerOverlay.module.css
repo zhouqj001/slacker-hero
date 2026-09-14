@@ -1,0 +1,230 @@
+/* 茶水间 ·「独立弹窗」（v6，2026-09-05 定稿）。
+ * 壳（Tauri）内是独立 OS 窗口（URL 带 &tea=1 → .overlayTea 整窗渲染）；
+ * 纯浏览器回落 v5 角落浮窗（.overlay）。两形态共享 --pa-* 桥接色板 →
+ * dsh 主题令牌（design-platform.css 的 --dsw-alias-*），明暗自动跟随，
+ * 游戏/股票/小说子视图一并换装。 */
+
+/* ── 共享桥接色板（含独立小说窗：阅读器弹窗/目录浮层均取 --pa-*，
+   此前 .overlayNovel 缺变量 → overlayPanel 的 var(--pa-bg) 未定义 → 透明） ── */
+.overlay,
+.overlayTea,
+.overlayNovel {
+  --pa-bg: var(--dsw-alias-bg-base, #17191f);            /* 窗体底 */
+  --pa-bg2: var(--dsw-alias-bg-layer-1, #1c1e25);        /* 内容面 */
+  --pa-bg3: var(--dsw-alias-bg-layer-2, #212329);        /* 胶囊/控件面 */
+  --pa-text: var(--dsw-alias-label-secondary, #c3c9d4);  /* 正文 */
+  --pa-text2: var(--dsw-alias-label-secondary, #c3c9d4); /* 次级文字 */
+  /* 弱化文字：caption 向次级色半混合 —— 部分主题（尤其浅色）caption 与背景
+     对比过低（股票代码等小字不可读），混入 secondary 保底可读性。 */
+  --pa-text3: color-mix(in srgb, var(--dsw-alias-label-caption, #7e8593), var(--dsw-alias-label-secondary, #c3c9d4));
+  --pa-cream: var(--dsw-alias-label-primary, #eef1f6);   /* 最高强调 */
+  --pa-line: var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.06));
+  --pa-line2: var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.12));
+  --pa-hover: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  --pa-lamp: var(--dsw-alias-state-business-primary, #4d6bfe); /* 品牌蓝 */
+  --pa-deep: var(--dsw-alias-button-info-hover, #3d58d8);
+  --pa-glow: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 14%, transparent);
+  --pa-soft: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 10%, transparent);
+  --pa-warmline: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 45%, transparent);
+  --pa-warmline-soft: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4d6bfe) 25%, transparent);
+}
+
+/* ── 共享布局/字色 ── */
+.overlay,
+.overlayTea {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--pa-text);
+  background: var(--pa-bg);
+}
+
+/* ── 整窗形态（独立茶水窗，铺满窗口即全部） ── */
+.overlayTea {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  /* 茶水间内所有页面/子页面文本不可选中（游戏/小说/股票及其子视图）。 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ── 小说阅读窗（独立只读弹窗）：整窗即阅读器，无 header/footer ── */
+.overlayNovel {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  background: var(--pa-bg);
+  /* 阅读窗口是「安静浮层」：全部文本不可选中，防止误拖拽/复制痕迹。 */
+  user-select: none;
+}
+
+.bodyNovel {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+
+.bodyNovel > * {
+  height: 100%;
+}
+
+/* ── 浮窗形态（纯浏览器回落）：右下角小窗 ── */
+.overlay {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1000;
+  width: 380px;
+  height: min(560px, calc(100vh - 32px));
+  border-radius: 14px;
+  border: 0.5px solid var(--dsw-alias-border-l3, rgba(255, 255, 255, 0.16));
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.4);
+  animation: popIn 0.2s cubic-bezier(0.2, 0.85, 0.25, 1) both;
+}
+
+@keyframes popIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+}
+
+/* ── 紧凑窗头：标题 + 标签 + 关闭 ── */
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+  flex: none;
+  padding: 0 8px 0 14px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l3, rgba(255, 255, 255, 0.16));
+  background: var(--dsw-specific-sidebar-fill, #191b21);
+  /* 壳内头部是窗口拖拽区：禁选中，避免拖动时划选文字 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--dsw-alias-label-tertiary, #9aa3b5);
+  white-space: nowrap;
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tab,
+.tabActive {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--dsw-alias-label-secondary, #c3c9d4);
+  background: transparent;
+  white-space: nowrap;
+  transition: background 0.14s, color 0.14s;
+}
+
+.tab:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.tabActive {
+  color: var(--dsw-alias-label-primary, #eef1f6);
+}
+
+/* 指示灯珠：激活 = 荧光绿呼吸（设备电源灯，与游戏区街机绿同源） */
+.tabDot {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 35%, transparent);
+  transition: background 0.14s;
+}
+
+.tabActive .tabDot {
+  background: #5fc98f;
+  box-shadow: 0 0 4px rgba(95, 201, 143, 0.6);
+  animation: tabBreath 2.2s ease-in-out infinite;
+}
+
+@keyframes tabBreath {
+  0%, 100% { box-shadow: 0 0 3px rgba(95, 201, 143, 0.4); }
+  50% { box-shadow: 0 0 7px rgba(95, 201, 143, 0.75); }
+}
+
+/* ── 窗控（无系统标题栏时自绘：— 最小化 / ✕ 关闭） ── */
+
+.headerRight {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.winBtn {
+  width: 34px;
+  height: 28px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, #9aa3b5);
+  background: transparent;
+  transition: background 0.14s, color 0.14s;
+}
+
+.winBtn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  color: var(--dsw-alias-label-primary, #eef1f6);
+}
+
+/* ── 内容：滚动流式，宽度交给子视图（均 width:100%+max-width） ── */
+
+.body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+}
+
+/* ── 快捷键脚条 ── */
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  flex: none;
+  font-size: 10.5px;
+  color: var(--dsw-alias-label-caption, #7e8593);
+  border-top: 0.5px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.12));
+  background: var(--dsw-specific-sidebar-fill, #191b21);
+}
+
+.footer kbd {
+  font: 10px ui-monospace, monospace;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--dsw-alias-label-tertiary, #9aa3b5);
+  background: var(--dsw-alias-bg-layer-2, #212329);
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.06));
+}

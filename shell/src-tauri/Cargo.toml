@@ -1,0 +1,46 @@
+[package]
+name = "slacker-shell"
+version = "0.1.0"
+description = "Minimal Tauri shell hosting the dsh web runtime"
+edition = "2021"
+
+[lib]
+name = "slacker_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Quote/kline/search fetching over plain http; default-features = false keeps
+# the feature set lean, but rustls-tls is required — eastmoney now rejects
+# plain-http quote/kline pulls (empty responses).
+# gzip: book-source sites often force gzip; decompress Rust-side.
+reqwest = { version = "0.13", default-features = false, features = ["gzip", "native-tls"] }
+# Eastmoney quote/kline/search endpoints return GB18030 bytes while the
+# headers claim application/json — decode Rust-side before JSON parsing.
+encoding_rs = "0.8"
+# Body transport to the webview as base64 (charset decoding stays client-side).
+base64 = "0.22"
+# Chapter-title regex splitting for local TXT novels (mirrors the client-side
+# splitChapters patterns; runs over raw bytes so offsets stay byte-based).
+regex = "1"
+# Pinned: anyhow 1.0.104 has an upstream regression (BacktraceStatus import
+# breaks under this feature set); 1.0.102 is the proven version from the main app.
+anyhow = "=1.0.102"
+# Native folder-picker for the novel download directory setting.
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+
+[profile.dev]
+# rustc 1.97.1 (x86_64-pc-windows-gnu) 在增量编译下会随机触发
+# rmeta::encoder "no entry found for key" ICE（本项目已多次复现，清 target 只能救一次）。
+# 关闭增量编译根除；代价是每次代码改动全量重编该 crate（约 1 分钟），可接受。
+incremental = false
+
+[profile.release]
+strip = true
+lto = true

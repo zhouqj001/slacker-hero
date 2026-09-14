@@ -1,0 +1,186 @@
+/* 贪吃蛇 · 街机 CRT 风：与 2048 同一套荧光绿设备屏（固定深底+自发光，
+ * 不随明暗主题变）。蛇身在网格上以 left/top transition 平滑滑行，
+ * 头高亮、向尾渐隐；果亮红灯标。 */
+
+.root {
+  --arc: #5fc98f;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  animation: snakeIn 0.2s ease both;
+}
+
+@keyframes snakeIn {
+  from { opacity: 0; transform: translateY(8px); }
+}
+
+/* ── LED 记分牌 ── */
+.bar {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 300px;
+}
+
+.stats {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.stat {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: #0a120d;
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.16);
+  overflow: hidden;
+}
+
+/* LED 面上的扫描线 */
+.stat::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.22) 0 1px, transparent 1px 3px);
+}
+
+.statLabel {
+  font: 500 8px/1 ui-monospace, monospace;
+  letter-spacing: 2px;
+  color: rgba(95, 201, 143, 0.55);
+}
+
+.stat b {
+  font: 700 18px/1.2 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--arc);
+  text-shadow: 0 0 6px rgba(95, 201, 143, 0.3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 重开键（文案走 locale，中英都容得下） */
+.new {
+  border: none;
+  border-radius: 8px;
+  padding: 0 12px;
+  cursor: pointer;
+  font: 700 11px/1 ui-monospace, monospace;
+  letter-spacing: 0.5px;
+  color: var(--arc);
+  background: rgba(95, 201, 143, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.28);
+  transition: 0.15s;
+}
+
+.new:hover {
+  background: rgba(95, 201, 143, 0.15);
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.5), 0 0 10px rgba(95, 201, 143, 0.2);
+}
+
+/* ── 荧光棋盘：暗底 + 极淡网格线 ── */
+.board {
+  position: relative;
+  width: 300px;
+  height: 300px;
+  border-radius: 10px;
+  background: #0a120d;
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.14);
+}
+
+.board::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, rgba(95, 201, 143, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(95, 201, 143, 0.05) 1px, transparent 1px);
+  background-size: 5% 5%;
+}
+
+/* 蛇单元格：绝对定位，靠 transition 平滑滑行 */
+.cell,
+.head {
+  position: absolute;
+  width: 4.55%;
+  height: 4.55%;
+  border-radius: 3px;
+  transition: left 0.11s ease, top 0.11s ease;
+}
+
+.cell {
+  background: rgba(95, 201, 143, 0.8);
+}
+
+.head {
+  z-index: 1;
+  background: #aef2cf;
+  box-shadow: 0 0 9px rgba(95, 201, 143, 0.65);
+}
+
+/* 果：红灯标慢闪 */
+.food {
+  position: absolute;
+  width: 4.55%;
+  height: 4.55%;
+  border-radius: 50%;
+  background: #e25757;
+  box-shadow: 0 0 9px rgba(226, 87, 87, 0.75);
+  animation: foodPulse 1.1s ease-in-out infinite;
+  transition: left 0.11s ease, top 0.11s ease;
+}
+
+@keyframes foodPulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(226, 87, 87, 0.7); }
+  50% { box-shadow: 0 0 15px rgba(226, 87, 87, 1); }
+}
+
+/* ── 结算 / 暂停层：屏幕故障信噪 ── */
+.over,
+.paused {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: 10px;
+  background: rgba(6, 12, 8, 0.88);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  font: 700 18px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 2px;
+  color: var(--arc);
+  text-shadow: 0 0 8px rgba(95, 201, 143, 0.35);
+  animation: overIn 0.25s ease both;
+}
+
+.paused {
+  background: rgba(6, 12, 8, 0.62);
+}
+
+.pausedSub {
+  font: 400 10px/1.6 ui-monospace, monospace;
+  letter-spacing: 1px;
+  text-align: center;
+  color: rgba(95, 201, 143, 0.6);
+}
+
+@keyframes overIn {
+  from { opacity: 0; }
+}
+
+.hint {
+  font-size: 11.5px;
+  color: var(--pa-text3);
+}

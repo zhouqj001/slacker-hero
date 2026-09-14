@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>自选行情</title>
+  <style>
+    :root {
+      --dsw-alias-bg-base: #17191f;
+      --dsw-alias-bg-layer-1: #1c1e25;
+      --dsw-alias-bg-layer-2: #212329;
+      --dsw-alias-label-primary: #eef1f6;
+      --dsw-alias-label-secondary: #c3c9d4;
+      --dsw-alias-label-caption: #7e8593;
+      --dsw-alias-border-l1: rgba(255, 255, 255, 0.06);
+      --dsw-alias-border-l2: rgba(255, 255, 255, 0.12);
+      --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.08);
+      --dsw-alias-state-business-primary: #4d6bfe;
+      --dsw-alias-button-info-hover: #3d58d8;
+    }
+    * { box-sizing: border-box; }
+    html, body, #root { height: 100%; margin: 0; }
+    /* 透明窗口：根背景必须透明，面板底色由插件自己画。 */
+    html { background: transparent; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+      background: transparent;
+      color: var(--dsw-alias-label-primary);
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+    }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--dsw-alias-border-l2); border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- 完整 ModuleLoader shim：支持相对 require 与模块缓存 -->
+  <script>
+    (() => {
+      const modules = Object.create(null);
+      const factories = Object.create(null);
+      let currentModulePath = '';
+
+      function resolveRelative(request, fromPath) {
+        if (!request.startsWith('.')) return request;
+        const base = fromPath.replace(/\/[^/]+$/, '');
+        const parts = (base + '/' + request).split('/');
+        const resolved = [];
+        for (const part of parts) {
+          if (part === '..') resolved.pop();
+          else if (part !== '.' && part !== '') resolved.push(part);
+        }
+        return resolved.join('/');
+      }
+
+      window.__ModuleLoader__ = {
+        load({ id, factory }) {
+          factories[id] = factory;
+        },
+        require(id, fromPath = '') {
+          const resolvedId = resolveRelative(id, fromPath || currentModulePath);
+          if (modules[resolvedId]) return modules[resolvedId];
+          if (resolvedId === 'react') return React;
+          if (resolvedId === 'react/jsx-runtime') return ReactJSXRuntime;
+          if (resolvedId === 'react-dom') return ReactDOM;
+          if (resolvedId === 'react-dom/client') return ReactDOMClient;
+          if (factories[resolvedId]) {
+            const prevPath = currentModulePath;
+            currentModulePath = resolvedId;
+            const module = { exports: {} };
+            const require = (name) => window.__ModuleLoader__.require(name, resolvedId);
+            // 工厂把导出写进自己作用域内的 module.exports 并 return 交付；
+            // 取返回值，无返回值时兜底外层 module.exports。
+            const ret = factories[resolvedId](require, module, module.exports);
+            currentModulePath = prevPath;
+            modules[resolvedId] = ret !== undefined ? ret : module.exports;
+            return modules[resolvedId];
+          }
+          throw new Error('Module not found: ' + resolvedId);
+        }
+      };
+    })();
+  </script>
+  <!-- React 18 UMD（自托管 vendor，classic 脚本；不依赖 CDN、无 ESM 兼容问题） -->
+  <script src="./vendor/react.production.min.js"></script>
+  <script src="./vendor/react-dom.production.min.js"></script>
+  <script>
+    window.React = React;
+    window.ReactDOM = ReactDOM;
+    // react-dom 的 UMD 已含 createRoot，「react-dom/client」以别名提供
+    window.ReactDOMClient = { createRoot: ReactDOM.createRoot };
+    // jsx-runtime：独立窗产物走 JSX 转换时等价实现
+    window.ReactJSXRuntime = {
+      Fragment: React.Fragment,
+      jsx: (type, props, key) => React.createElement(type, props ? Object.assign({}, props, key !== undefined ? { key } : null) : undefined),
+      jsxs: (type, props, key) => React.createElement(type, props ? Object.assign({}, props, key !== undefined ? { key } : null) : undefined),
+    };
+  </script>
+  <script>
+    // 固定深色：摸鱼独立窗不跟随 dsh 主窗主题（主窗切浅色时也保持深色隐蔽）。
+    // 仅应用「弹窗配色」自定义覆盖（kv slacker.popupColors 的本模块段，来自壳
+    // 缓存的 slacker_theme_get 快照 + slacker:theme 实时广播）。无桥（纯浏览器
+    // 调试）时静默使用本页 :root 默认深色。
+    (() => {
+      // 弹性配色字段 → 覆盖的根 CSS 变量；须与 theme-bridge 的 POPUP_VAR_MAP 一致。
+      const CUSTOM_VAR = {
+        bg: '--dsw-alias-bg-base',
+        fg: '--dsw-alias-label-primary',
+        fg2: '--dsw-alias-label-secondary',
+        accent: '--dsw-alias-state-business-primary',
+      }
+      const MODULE = 'stock'
+      const apply = (payload) => {
+        const snap = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null
+        if (!snap) return
+        const st = document.documentElement.style
+        // 自定义配色：先清掉上次覆盖，再应用本模块段（留空即固定深色默认）。
+        for (const k of Object.keys(CUSTOM_VAR)) { st.removeProperty(CUSTOM_VAR[k]) }
+        const block = snap.custom && typeof snap.custom === 'object' ? snap.custom[MODULE] : null
+        if (block && typeof block === 'object') {
+          for (const k of Object.keys(CUSTOM_VAR)) {
+            const v = block[k]
+            if (typeof v === 'string' && v !== '') { try { st.setProperty(CUSTOM_VAR[k], v) } catch { /* ignore */ } }
+          }
+        }
+      }
+      const bridge = window.__TAURI__
+      if (!bridge || !bridge.core || !bridge.event) return
+      bridge.core.invoke('slacker_theme_get').then(apply).catch(() => {})
+      bridge.event.listen('slacker:theme', (e) => apply(e.payload)).catch(() => {})
+    })();
+  </script>
+  <!-- 股票悬浮窗独立窗口入口：自包含（内部 StockMiniWindow） -->
+  <script src="./@slacker/ui-slacker/stock-mini.js"></script>
+  <script>
+    window.__SLACKER_STOCK_MINI__ = true;
+  </script>
+  <!-- 触发入口 factory：运行 stock-mini.js 并挂载悬浮窗 -->
+  <script>
+    window.__ModuleLoader__.require('@slacker/ui-slacker');
+  </script>
+</body>
+</html>

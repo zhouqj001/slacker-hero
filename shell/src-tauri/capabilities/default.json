@@ -1,0 +1,31 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window capability, extended to the local dsh origin",
+  "windows": ["main", "tea", "novel-reader", "stock-mini"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "core:window:allow-hide",
+    "core:window:allow-is-minimized",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:app:default",
+    "allow-slacker-shell",
+    "allow-slacker-kv",
+    "allow-slacker-novel",
+    "allow-slacker-stock",
+    "allow-slacker-zhihu",
+    "allow-slacker-http",
+    "allow-slacker-read",
+    "allow-slacker-tea",
+    "allow-slacker-novel-window",
+    "allow-slacker-novel-float",
+    "allow-slacker-theme"
+  ]
+}

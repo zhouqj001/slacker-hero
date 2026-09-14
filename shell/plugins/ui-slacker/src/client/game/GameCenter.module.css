@@ -1,0 +1,39 @@
+/* Game center: warm back pill over the launched game. */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  animation: centerIn 0.2s ease both;
+}
+
+@keyframes centerIn {
+  from { opacity: 0; transform: translateY(8px); }
+}
+
+.back {
+  align-self: flex-start;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 13px;
+  cursor: pointer;
+  font: 700 10.5px/1 ui-monospace, monospace;
+  letter-spacing: 0.5px;
+  color: rgba(95, 201, 143, 0.85);
+  background: rgba(95, 201, 143, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.2);
+  transition: 0.15s;
+}
+
+.back::before {
+  content: '◀ ';
+  font-size: 8.5px;
+  vertical-align: 1px;
+}
+
+.back:hover {
+  color: #5fc98f;
+  background: rgba(95, 201, 143, 0.11);
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.4), 0 0 9px rgba(95, 201, 143, 0.15);
+}

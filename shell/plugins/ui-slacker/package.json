@@ -1,0 +1,31 @@
+{
+  "name": "@slacker/ui-slacker",
+  "description": "Slacker zone plugin: the leisure overlay (games, stocks, and the novel seat) over the work shell; the novel body is contributed by @slacker/novel",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./invariant": "./lib/invariant.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "bundle": "tsdown",
+    "watch": "tsdown --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "~18.3.1",
+    "lightningcss": "^1.32.0",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.2"
+  }
+}

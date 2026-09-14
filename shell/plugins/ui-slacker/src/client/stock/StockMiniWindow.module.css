@@ -1,0 +1,186 @@
+/* 常驻股票悬浮窗：透明无边框小窗，拖拽/置顶/刷新/关闭。
+ * 色板变量继承自 stock-mini.html :root，读写跟随主题。 */
+
+.root {
+  --mini-bg: #17191f;
+  --mini-text: #eef1f6;
+  --mini-text2: #c3c9d4;
+  --mini-text3: #7e8593;
+  --mini-line: rgba(255, 255, 255, 0.08);
+  --mini-hover: rgba(255, 255, 255, 0.08);
+  --mini-up: #f25a5a;
+  --mini-down: #4ed17e;
+
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  user-select: none;
+  color: var(--mini-text);
+  background: color-mix(in srgb, var(--mini-bg) 92%, transparent);
+  backdrop-filter: blur(14px);
+  border-radius: 14px;
+  box-shadow:
+    inset 0 0 0 1px var(--mini-line),
+    0 18px 40px -12px rgba(0, 0, 0, 0.55);
+}
+
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 6px 12px;
+  cursor: move;
+}
+
+.hTitle {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.count {
+  font: 10px ui-monospace, monospace;
+  font-weight: 700;
+  color: var(--mini-text3);
+}
+
+.actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.act {
+  border: none;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--mini-text3);
+  background: none;
+  transition: 0.15s;
+}
+
+.act:hover {
+  color: var(--mini-text);
+  background: var(--mini-hover);
+}
+
+.close:hover {
+  color: #ff8f8f;
+  background: rgba(242, 90, 90, 0.14);
+}
+
+.pinOn {
+  color: #4d6bfe;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 4px 4px;
+}
+
+.list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 9px;
+}
+
+.row:hover {
+  background: var(--mini-hover);
+}
+
+.rName {
+  min-width: 0;
+  flex: 1;
+}
+
+.rTitle {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rCode {
+  font: 10px ui-monospace, monospace;
+  color: var(--mini-text3);
+}
+
+.rQuote {
+  flex: none;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.rPrice {
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.rChg {
+  font-size: 10.5px;
+  opacity: 0.85;
+}
+
+.up { color: var(--mini-up); }
+.down { color: var(--mini-down); }
+.flat { color: var(--mini-text3); }
+
+.empty {
+  padding: 22px 10px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--mini-text3);
+  line-height: 1.5;
+}
+
+.footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--mini-line);
+}
+
+.fTime {
+  font: 10px ui-monospace, monospace;
+  color: var(--mini-text3);
+}
+
+.fHint {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--mini-text3);
+  opacity: 0.7;
+}

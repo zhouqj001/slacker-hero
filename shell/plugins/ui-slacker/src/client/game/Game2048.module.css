@@ -1,0 +1,167 @@
+/* 2048 · 街机 CRT 风：LED 记分牌（扫描线 + 荧光数字）+ 荧光能量梯度棋盘
+ * （绿 → 黄 → 琥珀，数字越大能量越高）。棋盘是"设备屏"，不随主题变。 */
+
+.root {
+  --arc: #5fc98f;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  animation: g2048In 0.2s ease both;
+}
+
+@keyframes g2048In {
+  from { opacity: 0; transform: translateY(8px); }
+}
+
+/* ── LED 记分牌 ── */
+.bar {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 280px;
+}
+
+.stats {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.stat {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: #0a120d;
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.16);
+  overflow: hidden;
+}
+
+/* LED 面上的扫描线 */
+.stat::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.22) 0 1px, transparent 1px 3px);
+}
+
+.statLabel {
+  font: 500 8px/1 ui-monospace, monospace;
+  letter-spacing: 2px;
+  color: rgba(95, 201, 143, 0.55);
+}
+
+.stat b {
+  font: 700 18px/1.2 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--arc);
+  text-shadow: 0 0 6px rgba(95, 201, 143, 0.3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* RESET 键（文案走 locale，中英都容得下） */
+.new {
+  border: none;
+  border-radius: 8px;
+  padding: 0 12px;
+  cursor: pointer;
+  font: 700 11px/1 ui-monospace, monospace;
+  letter-spacing: 0.5px;
+  color: var(--arc);
+  background: rgba(95, 201, 143, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.28);
+  transition: 0.15s;
+}
+
+.new:hover {
+  background: rgba(95, 201, 143, 0.15);
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.5), 0 0 10px rgba(95, 201, 143, 0.2);
+}
+
+/* ── 荧光棋盘 ── */
+.board {
+  position: relative;
+  width: 280px;
+  height: 280px;
+  border-radius: 10px;
+  background: #0a120d;
+  box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.14);
+  display: grid;
+  grid-template: repeat(4, 1fr) / repeat(4, 1fr);
+  gap: 7px;
+  padding: 7px;
+}
+
+.board > div {
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 700 22px ui-monospace, "Cascadia Mono", Consolas, monospace;
+  transition: background 0.1s;
+}
+
+.pop {
+  animation: g2048-pop 0.18s ease;
+}
+
+@keyframes g2048-pop {
+  from { transform: scale(0.3); opacity: 0.4; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+/* 能量梯度：底色绿→黄→琥珀；字色只分两档（深底块=近白，亮底块=深墨）
+ * 保证对比；辉光只给底块且收敛，不糊字。 */
+.t0 { background: rgba(95, 201, 143, 0.05); box-shadow: inset 0 0 0 1px rgba(95, 201, 143, 0.08); }
+.t2 { background: rgba(95, 201, 143, 0.09); color: #e6f7ec; }
+.t4 { background: rgba(95, 201, 143, 0.17); color: #e6f7ec; }
+.t8 { background: rgba(95, 201, 143, 0.28); color: #eefaf3; }
+.t16 { background: #5fc98f; color: #071009; box-shadow: 0 0 9px rgba(95, 201, 143, 0.32); }
+.t32 { background: #a3d97b; color: #14210e; box-shadow: 0 0 9px rgba(163, 217, 123, 0.32); }
+.t64 { background: #d9e07b; color: #242408; box-shadow: 0 0 9px rgba(217, 224, 123, 0.32); }
+.t128 { background: #ecc96d; color: #2d2405; font-size: 19px; box-shadow: 0 0 11px rgba(236, 201, 109, 0.38); }
+.t256 { background: #eab55f; color: #2f1d03; font-size: 19px; box-shadow: 0 0 11px rgba(234, 181, 95, 0.42); }
+.t512 { background: #e89d55; color: #2a1300; font-size: 19px; box-shadow: 0 0 12px rgba(232, 157, 85, 0.45); }
+.t1024 { background: #e6814d; color: #2a0f04; font-size: 15px; box-shadow: 0 0 12px rgba(230, 129, 77, 0.5); }
+.t2048 { background: #e25757; color: #330606; font-size: 15px; box-shadow: 0 0 16px rgba(226, 87, 87, 0.6); animation: hot 1.6s ease-in-out infinite; }
+
+@keyframes hot {
+  0%, 100% { box-shadow: 0 0 16px rgba(226, 87, 87, 0.6); }
+  50% { box-shadow: 0 0 26px rgba(226, 87, 87, 0.85); }
+}
+
+/* ── 结算层：屏幕故障黑屏 + 像素字 ── */
+.over {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: 10px;
+  background: rgba(6, 12, 8, 0.88);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  font: 700 18px/1 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 2px;
+  color: var(--arc);
+  text-shadow: 0 0 8px rgba(95, 201, 143, 0.35);
+  animation: overIn 0.25s ease both;
+}
+
+@keyframes overIn {
+  from { opacity: 0; }
+}
+
+.hint {
+  font-size: 11.5px;
+  color: var(--pa-text3);
+}

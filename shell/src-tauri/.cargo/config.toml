@@ -1,0 +1,4 @@
+# rustc crashes (STATUS_ACCESS_VIOLATION / HEAP_CORRUPTION) under full
+# parallelism on this machine; the main app builds fine at reduced jobs.
+[build]
+jobs = 4
