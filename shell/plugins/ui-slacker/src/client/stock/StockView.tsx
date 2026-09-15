@@ -78,7 +78,7 @@ function sparkPaths(points: readonly number[]): { line: string; area: string } {
   ] as const)
   const segs = coords.map(([x, y]) => 'L' + x.toFixed(2) + ' ' + y.toFixed(2))
   const line = 'M' + coords[0]![0].toFixed(2) + ' ' + coords[0]![1].toFixed(2) + segs.join('')
-  const area = 'M0 ' + SPARK_H + line.slice(1) + 'L' + SPARK_W + ' ' + SPARK_H + ' Z'
+  const area = 'M0 ' + SPARK_H + ' L' + line.slice(1) + ' L' + SPARK_W + ' ' + SPARK_H + ' Z'
   return { line, area }
 }
 

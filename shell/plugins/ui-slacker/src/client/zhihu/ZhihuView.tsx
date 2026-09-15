@@ -1,7 +1,7 @@
 /**
  * 知乎摸鱼：推荐流卡片 + Cookie 登录 + 四层去重 + 就地展开读正文。
- * 数据全部经壳的 Rust 代理（zhihuFeed/zhihuContent/zhihuReportRead/zhihuMe，
- * Cookie 与浏览器头在 Rust 侧注入）；纯浏览器内不可用（显示引导）。
+ * 数据全部经壳的 Rust 代理（zhihuFeed/zhihuContent/zhihuComments/
+ * zhihuReportRead/zhihuMe，Cookie 与浏览器头在 Rust 侧注入）；纯浏览器内不可用（显示引导）。
  *
  * 业务逻辑（照 weread-vscode TouchPlus 的知乎模块）：
  *  - 翻页三参数（session_token/page_number/end_offset）从 paging.next 解析，
@@ -14,7 +14,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import {
-  isZhihuAuthError, kvGet, kvSet, zhihuContent, zhihuFeed, zhihuMe, zhihuReportRead,
+  isZhihuAuthError, kvGet, kvSet, zhihuComments, zhihuContent, zhihuFeed, zhihuImage, zhihuMe,
+  zhihuReportRead,
 } from '../ipc.ts'
 import type { SlackerKey } from '../locales.ts'
 import css from './ZhihuView.module.css'
@@ -36,6 +37,9 @@ const REPORT_BREAKER = 3
 /** 一屏新卡的最少条数：过滤后攒够即停（避免连环翻页）。 */
 const BATCH_MIN = 5
 
+/** 评论每页条数（root_comments 分页）。 */
+const COMMENT_PAGE = 20
+
 /** 翻页游标：三参数一起走。 */
 interface PageCursor {
   pageNumber: number
@@ -52,10 +56,22 @@ interface ZhihuCard {
   excerpt: string
   author: string
   meta: string
+  /** 评论数（缩写后，如 128 / 1.2w；feed 未带则为空）。 */
+  commentCount: string
   attachedInfo?: string
 }
 
-/** 详情视图状态。 */
+/** 一条评论（root_comments 归一化后；楼中楼挂 children）。 */
+interface CommentItem {
+  id: string
+  author: string
+  content: string
+  time: string
+  likes: number
+  children: CommentItem[]
+}
+
+/** 详情视图状态（正文 + 评论区，就地展开在卡片下方）。 */
 interface DetailState {
   card: ZhihuCard
   byline: string
@@ -63,6 +79,15 @@ interface DetailState {
   shown: number
   loading: boolean
   error: string | null
+  comments: CommentItem[]
+  /** 评论区是否展开（主动点击才展开，不默认加载）。 */
+  commentsOpen: boolean
+  /** 本轮展开是否已拉过首页（收起再展开不重复拉）。 */
+  commentsLoaded: boolean
+  commentsLoading: boolean
+  commentsErr: boolean
+  commentsEnd: boolean
+  commentsOffset: number
 }
 
 /** 数字缩写（知乎风格）：12345 → 1.2w。 */
@@ -85,6 +110,7 @@ function toCard(item: Record<string, unknown>): ZhihuCard | null {
   if (feedId === '' || targetId === '') return null
   const author = String((target.author as Record<string, unknown> | undefined)?.name ?? '')
   const votes = abbrev(target.voteup_count)
+  const commentCount = abbrev(target.comment_count)
   let kind: ZhihuCard['kind']
   let title = ''
   let excerpt = ''
@@ -111,7 +137,7 @@ function toCard(item: Record<string, unknown>): ZhihuCard | null {
   const attachedInfo = typeof item.attached_info === 'string' && item.attached_info !== ''
     ? item.attached_info
     : undefined
-  return { feedId, kind, targetId, title, excerpt, author, meta, attachedInfo }
+  return { feedId, kind, targetId, title, excerpt, author, meta, commentCount, attachedInfo }
 }
 
 /** 从 paging.next 解析下一页游标；缺参时保持本地兜底。 */
@@ -164,8 +190,11 @@ function cleanHtml(html: string): string {
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
     .replace(/<img[^>]*>/gi, tag => {
       const m = tag.match(/data-original="([^"]+)"|data-actualsrc="([^"]+)"|src="([^"]+)"/i)
-      const url = m?.[1] ?? m?.[2] ?? m?.[3]
-      return url !== undefined && url !== '' ? `\n[IMG:${url}]\n` : ''
+      let url = m?.[1] ?? m?.[2] ?? m?.[3]
+      if (url === undefined || url === '') return ''
+      // zhimg 的 http 直链会被 WebView2 按混合内容拦掉，统一升级 https
+      url = url.replace(/^http:\/\//i, 'https://')
+      return `\n[IMG:${url}]\n`
     })
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n\n')
@@ -177,6 +206,53 @@ function cleanHtml(html: string): string {
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
   return s.trim()
+}
+
+/** 评论 HTML → 纯文本（去标签 + 实体反转义；评论里的图片直接丢弃）。 */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<img[^>]*>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .trim()
+}
+
+/** Unix 秒 → YYYY-MM-DD（无效输入返回空串）。 */
+function fmtDate(sec: unknown): string {
+  const v = typeof sec === 'number' ? sec : Number(sec)
+  if (!Number.isFinite(v) || v <= 0) return ''
+  const d = new Date(v * 1000)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** root_comments 响应 → 归一化评论树（author 兼容 member.name 与 name）。 */
+function parseComments(raw: unknown): CommentItem[] {
+  const data = (raw as { data?: unknown }).data
+  if (!Array.isArray(data)) return []
+  const pick = (c: Record<string, unknown>): CommentItem => {
+    const author = c.author as Record<string, unknown> | undefined
+    const kids = Array.isArray(c.child_comments) ? c.child_comments : []
+    return {
+      id: String(c.id ?? ''),
+      author: String((author?.member as Record<string, unknown> | undefined)?.name ?? author?.name ?? ''),
+      content: stripHtml(String(c.content ?? '')),
+      time: fmtDate(c.created_time),
+      likes: typeof c.like_count === 'number' ? c.like_count : 0,
+      children: kids
+        .filter((k): k is Record<string, unknown> => k !== null && typeof k === 'object')
+        .map(pick),
+    }
+  }
+  return data
+    .filter((c): c is Record<string, unknown> => c !== null && typeof c === 'object')
+    .map(pick)
 }
 
 /** 把纯文本按 ~CHUNK_SIZE 字符切段（段为原子，图片占位不被劈开）。 */
@@ -232,6 +308,9 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
   const cookieRef = useRef('')
   const reportFailsRef = useRef(0)
   const bannerAtRef = useRef(0)
+  const detailRef = useRef<HTMLDivElement | null>(null)
+  const scrolledFeedRef = useRef<string | null>(null)
+  const listRef = useRef<HTMLDivElement | null>(null)
 
   cookieRef.current = cookie
 
@@ -337,6 +416,17 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  /** 详情就地展开后滚入视野（同一篇只滚一次，不打断阅读位置）。 */
+  useEffect(() => {
+    if (detail === null) { scrolledFeedRef.current = null; return }
+    if (scrolledFeedRef.current === detail.card.feedId) return
+    scrolledFeedRef.current = detail.card.feedId
+    const id = window.setTimeout(() => {
+      detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }, 80)
+    return () => { window.clearTimeout(id) }
+  }, [detail])
+
   /** 保存 Cookie：先 /v4/me 校验再落 kv。 */
   async function saveCookie(): Promise<void> {
     const text = editorText.trim()
@@ -363,7 +453,7 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
     }
   }
 
-  /** 打开详情：就地切详情视图并加载正文。 */
+  /** 打开详情：卡片下方就地展开，仅拉正文；评论区点开才加载。 */
   function openDetail(card: ZhihuCard): void {
     markSeen(card)
     setDetail({
@@ -373,6 +463,13 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
       shown: 1,
       loading: true,
       error: null,
+      comments: [],
+      commentsOpen: false,
+      commentsLoaded: false,
+      commentsLoading: false,
+      commentsErr: false,
+      commentsEnd: false,
+      commentsOffset: 0,
     })
     void (async () => {
       try {
@@ -380,7 +477,18 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
         let html = ''
         if (card.kind === 'pin') {
           const blocks = (Array.isArray(raw.content) ? raw.content : []) as Array<Record<string, unknown>>
-          html = blocks.map(b => String(b.content ?? '')).join('')
+          html = blocks.map(b => {
+            // image block 的 content 是 { url } 数组：String() 会变
+            // "[object Object]" 把图全丢了，这里转成图片占位。
+            if (Array.isArray(b.content)) {
+              return (b.content as Array<Record<string, unknown>>)
+                .map(x => String(x.url ?? '').replace(/^http:\/\//i, 'https://'))
+                .filter(u => u !== '')
+                .map(u => `\n[IMG:${u}]\n`)
+                .join('')
+            }
+            return String(b.content ?? '')
+          }).join('')
         } else {
           html = String(raw.content ?? '')
         }
@@ -406,6 +514,40 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
     setDetail(d => d === null ? d : { ...d, shown: Math.min(d.chunks.length, d.shown + 1) })
   }
 
+  /** 拉一页评论（first=true 首屏重置；翻页失败静默，仅首页失败标错）。 */
+  async function loadComments(card: ZhihuCard, offset: number, first: boolean): Promise<void> {
+    try {
+      const raw = (await zhihuComments(
+        card.kind, card.targetId, cookieRef.current, offset, COMMENT_PAGE,
+      )) as Record<string, unknown>
+      const items = parseComments(raw)
+      const paging = (raw as { paging?: Record<string, unknown> }).paging ?? {}
+      setDetail(d => d?.card.feedId !== card.feedId ? d : {
+        ...d,
+        comments: first ? items : [...d.comments, ...items],
+        commentsLoading: false,
+        commentsErr: false,
+        commentsEnd: paging.is_end === true || items.length === 0,
+        commentsOffset: offset + items.length,
+      })
+    } catch {
+      setDetail(d => d?.card.feedId !== card.feedId ? d
+        : { ...d, commentsLoading: false, commentsErr: first })
+    }
+  }
+
+  /** 展开/收起评论区：首次展开才拉首页，收起再展开用已加载的数据。 */
+  function toggleComments(): void {
+    if (detail === null) return
+    const open = !detail.commentsOpen
+    if (open && !detail.commentsLoaded) {
+      void loadComments(detail.card, 0, true)
+      setDetail(d => d === null ? d : { ...d, commentsOpen: true, commentsLoaded: true })
+      return
+    }
+    setDetail(d => d === null ? d : { ...d, commentsOpen: open })
+  }
+
   /** 图片开关：落 kv（关闭时彻底不发图片请求——占位框替代）。 */
   function toggleImages(): void {
     const next = !images
@@ -416,6 +558,14 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
   /** 换一批：重置游标 + 会话去重（持久已读历史保留，不重复推已读篇）。 */
   function resetFeed(): void {
     void load(true)
+  }
+
+  /** 列表滚到接近底部：自动续拉下一页（loadingRef 天然去抖）。 */
+  function onListScroll(): void {
+    const el = listRef.current
+    if (el === null) return
+    if (loadingRef.current || endReached || cards.length === 0) return
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 480) void load(false)
   }
 
   /** 清已读历史：持久 seenTargetKeys 清空（重置后可能重新见到旧篇）。 */
@@ -472,6 +622,7 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
           title={t('zhihu.images')}
           onClick={toggleImages}
         >
+          <span className={css.dot} />
           {t('zhihu.images')}
         </button>
         <button type="button" className={css.pill} onClick={resetFeed}>{t('zhihu.reset')}</button>
@@ -490,62 +641,172 @@ export function ZhihuView(props: ZhihuViewProps): JSX.Element {
       {banner && <div className={css.banner}>{t('zhihu.cookieBad')}</div>}
       {editorOpen && editor}
 
-      {detail !== null ? (
-        <div className={css.detail}>
-          <div className={css.detailHead}>
-            <button type="button" className={css.back} onClick={() => { setDetail(null) }}>
-              ‹ {t('zhihu.back')}
-            </button>
-            <span className={css.detailMeta}>{detail.byline}</span>
-          </div>
-          {detail.card.title !== '' && <h3 className={css.detailTitle}>{detail.card.title}</h3>}
-          {detail.loading && <div className={css.state}>{t('zhihu.loading')}</div>}
-          {detail.error !== null && <div className={css.state}>{detail.error}</div>}
-          {!detail.loading && detail.error === null && (
-            <>
-              {detail.chunks.slice(0, detail.shown).map((chunk, i) => (
-                <div key={i} className={css.prose}>{renderChunk(chunk, images, t)}</div>
-              ))}
-              {detail.chunks.length > detail.shown && (
-                <button type="button" className={css.more} onClick={expand}>{t('zhihu.readAll')}</button>
+      <div className={css.list} ref={listRef} onScroll={onListScroll}>
+        {cards.map(c => {
+          const open = detail !== null && detail.card.feedId === c.feedId
+          return (
+            <div key={c.feedId} className={open ? `${css.item} ${css.itemOpen}` : css.item}>
+              <button
+                type="button"
+                className={css.card}
+                onClick={() => { if (open) setDetail(null); else openDetail(c) }}
+              >
+                <span className={css.cardMeta}>{c.meta}{c.author !== '' ? ' · ' + c.author : ''}</span>
+                {c.title !== '' && <b className={css.cardTitle}>{c.title}</b>}
+                {c.excerpt !== '' && <span className={css.cardExcerpt}>{c.excerpt}</span>}
+              </button>
+              {open && detail !== null && (
+                <div className={css.detail} ref={detailRef}>
+                  <div className={css.detailHead}>
+                    <button type="button" className={css.back} onClick={() => { setDetail(null) }}>
+                      {t('zhihu.collapse')}
+                    </button>
+                    <span className={css.detailMeta}>{detail.byline}</span>
+                  </div>
+                  {detail.card.title !== '' && <h3 className={css.detailTitle}>{detail.card.title}</h3>}
+                  {detail.loading && <div className={css.state}>{t('zhihu.loading')}</div>}
+                  {detail.error !== null && <div className={css.state}>{detail.error}</div>}
+                  {!detail.loading && detail.error === null && (
+                    <>
+                      {detail.chunks.slice(0, detail.shown).map((chunk, i) => (
+                        <div key={i} className={css.prose}>{renderChunk(chunk, images, cookie, t)}</div>
+                      ))}
+                      {detail.chunks.length > detail.shown && (
+                        <button type="button" className={css.more} onClick={expand}>{t('zhihu.readAll')}</button>
+                      )}
+                    </>
+                  )}
+                  <CommentsBlock
+                    detail={detail}
+                    t={t}
+                    onToggle={toggleComments}
+                    onLoadMore={offset => { void loadComments(detail.card, offset, false) }}
+                  />
+                </div>
               )}
-            </>
+            </div>
+          )
+        })}
+        {loading && <div className={css.state}>{t('zhihu.loading')}</div>}
+        {!loading && cards.length === 0 && (
+          <div className={css.state}>{failed ? t('zhihu.error') : t('zhihu.empty')}</div>
+        )}
+        {!loading && !endReached && cards.length > 0 && (
+          <button type="button" className={css.more} onClick={() => { void load(false) }}>
+            {t('zhihu.loadMore')}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** 渲染一段正文：[IMG:url] 占位转代理加载的 <img>，或关闭时的占位框；
+ *  其余文本按 \n 换行。 */
+function renderChunk(
+  text: string, images: boolean, cookie: string, t: (key: SlackerKey) => string,
+): JSX.Element[] {
+  return text.split(/(\[IMG:[^\]]+\])/).map((part, i) => {
+    const m = part.match(/^\[IMG:([^\]]+)\]$/)
+    if (m !== null) {
+      return images
+        ? <ZhihuImg key={i} src={m[1]} cookie={cookie} />
+        : <span key={i} className={css.imgHidden}>{'🖼 ' + t('zhihu.imgHidden')}</span>
+    }
+    return <span key={i}>{part}</span>
+  })
+}
+
+/** 知乎图片 data-URL 缓存（模块级）：同 URL 不重复经 IPC 拉取。 */
+const imgCache = new Map<string, string>()
+
+/** 知乎图片：WebView 直连 zhimg 会被防盗链/风控掐掉（全 403 → 全隐藏），
+ *  因此统一走 Rust 代理（同 Cookie/UA 拉回转 data URL）；加载中灰占位，
+ *  失败静默隐藏。 */
+function ZhihuImg(props: { src: string; cookie: string }): JSX.Element {
+  const { src, cookie } = props
+  const [url, setUrl] = useState(() => imgCache.get(src) ?? '')
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    const hit = imgCache.get(src)
+    if (hit !== undefined) { setUrl(hit); return }
+    let alive = true
+    void zhihuImage(src, cookie).then(dataUrl => {
+      if (imgCache.size >= 200) imgCache.clear()
+      imgCache.set(src, dataUrl)
+      if (alive) setUrl(dataUrl)
+    }).catch(() => { if (alive) setFailed(true) })
+    return () => { alive = false }
+  }, [src, cookie])
+  if (failed) return <></>
+  if (url === '') return <div className={css.imgLoad} />
+  return <img className={css.img} src={url} alt="" />
+}
+
+/** 详情里的评论区（默认收起，点头部展开才拉首页；「更多评论」翻页）。 */
+function CommentsBlock(props: {
+  detail: DetailState
+  t: (key: SlackerKey) => string
+  onToggle: () => void
+  onLoadMore: (offset: number) => void
+}): JSX.Element {
+  const { detail, t, onToggle, onLoadMore } = props
+  const count = detail.card.commentCount !== '' ? detail.card.commentCount : String(detail.comments.length)
+  return (
+    <div className={css.comments}>
+      <button
+        type="button"
+        className={css.commentsHead}
+        onClick={onToggle}
+        title={detail.commentsOpen ? t('zhihu.collapse') : t('zhihu.comments')}
+      >
+        <span className={css.commentsArrow}>{detail.commentsOpen ? '▾' : '▸'}</span>
+        {t('zhihu.comments')}
+        {count !== '0' && <span className={css.commentsCount}>{count}</span>}
+      </button>
+      {detail.commentsOpen && (
+        <>
+          {detail.commentsLoading && detail.comments.length === 0 && (
+            <div className={css.state}>{t('zhihu.loading')}</div>
           )}
-        </div>
-      ) : (
-        <div className={css.list}>
-          {cards.map(c => (
-            <button type="button" key={c.feedId} className={css.card} onClick={() => { openDetail(c) }}>
-              <span className={css.cardMeta}>{c.meta}{c.author !== '' ? ' · ' + c.author : ''}</span>
-              {c.title !== '' && <b className={css.cardTitle}>{c.title}</b>}
-              {c.excerpt !== '' && <span className={css.cardExcerpt}>{c.excerpt}</span>}
-            </button>
+          {!detail.commentsLoading && detail.comments.length === 0 && (
+            <div className={css.state}>
+              {detail.commentsErr ? t('zhihu.commentsFail') : t('zhihu.commentsEmpty')}
+            </div>
+          )}
+          {detail.comments.map((c, i) => (
+            <CommentNode key={c.id !== '' ? c.id : `i${i}`} c={c} />
           ))}
-          {loading && <div className={css.state}>{t('zhihu.loading')}</div>}
-          {!loading && cards.length === 0 && (
-            <div className={css.state}>{failed ? t('zhihu.error') : t('zhihu.empty')}</div>
-          )}
-          {!loading && !endReached && cards.length > 0 && (
-            <button type="button" className={css.more} onClick={() => { void load(false) }}>
-              {t('zhihu.loadMore')}
+          {!detail.commentsEnd && detail.comments.length > 0 && (
+            <button
+              type="button"
+              className={css.more}
+              disabled={detail.commentsLoading}
+              onClick={() => { onLoadMore(detail.commentsOffset) }}
+            >
+              {detail.commentsLoading ? t('zhihu.loading') : t('zhihu.commentsMore')}
             </button>
           )}
-        </div>
+        </>
       )}
     </div>
   )
 }
 
-/** 渲染一段正文：[IMG:url] 占位转 <img>（referrerPolicy 空 Referer 直连
- *  zhimg CDN）或隐藏占位框；其余文本按 \n 换行。 */
-function renderChunk(text: string, images: boolean, t: (key: SlackerKey) => string): JSX.Element[] {
-  return text.split(/(\[IMG:[^\]]+\])/).map((part, i) => {
-    const m = part.match(/^\[IMG:([^\]]+)\]$/)
-    if (m !== null) {
-      return images
-        ? <img key={i} className={css.img} src={m[1]} referrerPolicy="no-referrer" alt="" loading="lazy" />
-        : <span key={i} className={css.imgHidden}>{'🖼 ' + t('zhihu.imgHidden')}</span>
-    }
-    return <span key={i}>{part}</span>
-  })
+/** 渲染一条评论；楼中楼嵌套渲染，缩进交给 CSS。 */
+function CommentNode(props: { c: CommentItem }): JSX.Element {
+  const { c } = props
+  const meta = [c.time, c.likes > 0 ? c.likes + ' 赞' : ''].filter(Boolean).join(' · ')
+  return (
+    <div className={css.comment}>
+      <div className={css.commentHead}>
+        <span className={css.commentAuthor}>{c.author !== '' ? c.author : '知乎用户'}</span>
+        {meta !== '' && <span className={css.commentMeta}>{meta}</span>}
+      </div>
+      <div className={css.commentBody}>{c.content}</div>
+      {c.children.map((kid, i) => (
+        <CommentNode key={kid.id !== '' ? kid.id : `i${i}`} c={kid} />
+      ))}
+    </div>
+  )
 }

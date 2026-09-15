@@ -1,5 +1,5 @@
 /**
- * Slacker shell: spawns the vendored dsh web runtime, parses its tokenized
+ * Slacker shell: spawns the dsh web runtime, parses its tokenized
  * URL from stdout, and navigates the main window to it. The shell owns the
  * process lifecycle (auto-restart, cleanup on exit) and exposes shell
  * commands to the remote page for the slacker overlay.
@@ -39,8 +39,10 @@ struct BootInfo {
     restarted: bool,
 }
 
-/** Vendor dsh entry, relative to the repo root (cwd = src-tauri at spawn). */
-const DSH_BIN: &str = "vendor/deepseek-harness/apps/cli/lib/bin.js";
+/** dsh CLI entry inside the npm-installed runtime (vendor/dsh-runtime),
+ * relative to the repo root (cwd = src-tauri at spawn). The runtime's
+ * node_modules is gitignored — restore with `npm install` in that dir. */
+const DSH_BIN: &str = "vendor/dsh-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js";
 
 /** Wait until a local TCP port accepts a connection. */
 fn wait_port(host: &str, port: u16, timeout: Duration) -> bool {
@@ -63,8 +65,10 @@ fn free_port() -> u16 {
 }
 
 /**
- * Spawn the vendored dsh web server and return its tokenized URL.
- * The URL line ("dsh web: http://…?token=…") is parsed from stdout.
+ * Spawn the dsh web server and return its tokenized URL.
+ * The URL line ("dsh web: http://…?token=…") is parsed from stdout; newer
+ * dsh may append " (LAN: http://…)" to the line, so only the first token
+ * is taken as the URL.
  */
 fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     let port = free_port();
@@ -86,6 +90,35 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     let home = repo_root.join(".dsh-dev").join("shell-home");
     std::fs::create_dir_all(&home).map_err(|e| format!("create dsh home: {e}"))?;
 
+    // The profile's file: dependencies (@slacker/novel, @slacker/ui-slacker)
+    // are written relative to the template's depth (shell/dsh-profile/slacker,
+    // 3 levels below the repo root), but the synced home profile sits one level
+    // deeper, so pnpm resolves them to <home>/plugins/<name>. Map that path
+    // onto the real plugins dir with a junction (needs no admin rights).
+    let plugins_link = home.join("plugins");
+    if !plugins_link.exists() {
+        let plugins_target = repo_root.join("shell").join("plugins");
+        #[cfg(target_os = "windows")]
+        {
+            let status = Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&plugins_link)
+                .arg(&plugins_target)
+                .status()
+                .map_err(|e| format!("create plugins junction: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "mklink /J failed: {} -> {}",
+                    plugins_link.display(),
+                    plugins_target.display()
+                ));
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        std::os::unix::fs::symlink(&plugins_target, &plugins_link)
+            .map_err(|e| format!("create plugins symlink: {e}"))?;
+    }
+
     // Sync the versioned profile template (shell/dsh-profile/slacker) into the
     // home so the slacker overlay row rides the profile layer, never a vendor
     // edit — vendor upgrades stay `git pull`-clean.
@@ -105,11 +138,17 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     // dsh resolves profile bundles from <DSH_HOME>/profiles/slacker/node_modules,
     // so on first boot (fresh clone / wiped home) install them from the synced
     // package.json. auto-install-peers must stay off: the @deepseek-ai/dsh-*
-    // peers are provided by the vendored runtime, and their semver ranges only
-    // match prereleases that are not on the public registry.
+    // peers are provided by the dsh runtime, and the plugins' semver ranges
+    // do not match the runtime's prerelease versions.
     if !profile_dst.join("node_modules").exists() {
         println!("[slacker] profile node_modules missing; running pnpm install...");
-        let status = Command::new("pnpm")
+        // Windows: pnpm ships as pnpm.cmd/ps1 shims (e.g. under nvm4w), and
+        // Command::new("pnpm") only resolves pnpm.exe — invoke the shim.
+        #[cfg(target_os = "windows")]
+        let mut install = Command::new("pnpm.cmd");
+        #[cfg(not(target_os = "windows"))]
+        let mut install = Command::new("pnpm");
+        let status = install
             .args(["install", "--config.auto-install-peers=false"])
             .current_dir(&profile_dst)
             .status()
@@ -120,6 +159,16 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
                     .into(),
             );
         }
+    }
+
+    // The runtime's node_modules is gitignored; a fresh clone without the
+    // one-time `npm install` in vendor/dsh-runtime would otherwise fail with
+    // a cryptic MODULE_NOT_FOUND inside dsh's stderr log after a 60s timeout.
+    if !repo_root.join(DSH_BIN).exists() {
+        return Err(
+            "dsh runtime missing: run `npm install` in vendor/dsh-runtime (see vendor/dsh-runtime/package.json)"
+                .into(),
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -161,10 +210,13 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
                 if let Some(rest) = line.strip_prefix("dsh web: ") {
-                    let url = rest.trim().to_string();
-                    if url.starts_with("http") {
-                        *url_arc.lock().unwrap() = Some(url);
-                        // Keep reading so the pipe does not fill; dsh stays chatty.
+                    // First whitespace token only: the line may end with a
+                    // " (LAN: http://…)" suffix in newer dsh releases.
+                    if let Some(url) = rest.split_whitespace().next() {
+                        if url.starts_with("http") {
+                            *url_arc.lock().unwrap() = Some(url.to_string());
+                            // Keep reading so the pipe does not fill; dsh stays chatty.
+                        }
                     }
                 }
             }
@@ -514,68 +566,66 @@ fn novel_chapter_res() -> &'static [regex::Regex] {
     })
 }
 
-/** 切章（字节偏移版；算法 = 客户端 splitChapters：全匹配 → 按位排序 →
- * 同位置去重（卷先到保留）→ 正文起点取标题 match 结束、终点取下条目前题起点）。 */
-fn split_novel_chapters(text: &str) -> Vec<NovelChapterBound> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    struct Mark {
-        index: usize,
-        len: usize,
-        line: String,
-        is_volume: bool,
-    }
-    let mut marks: Vec<Mark> = Vec::new();
-    for (is_volume, res) in [(true, novel_volume_res()), (false, novel_chapter_res())] {
-        for re in res {
-            let mut guard = 0usize;
-            for m in re.find_iter(text) {
+/** 流式扫描整本切出章节字节区间（语义同客户端 splitChapters）。
+ * 逐行读、只记标题行的字节偏移，大文件也只占常量内存；调用方放
+ * spawn_blocking 跑，不再像旧版那样整本 read_to_string + 全文正则
+ * （那会先把全应用冻住几秒）。 */
+fn scan_novel_toc(path: &std::path::Path, name: &str) -> Result<Vec<NovelChapterBound>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("load novel {name}: {e}"))?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    // (标题行首偏移, 正文起点, 标题, 是否卷)；行序天然有序，无需再排序去重。
+    let mut marks: Vec<(usize, usize, String, bool)> = Vec::new();
+    let mut offset = 0usize;
+    let mut line = String::new();
+    let mut guard = 0usize;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(|e| format!("load novel {name}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        // trim_end 吃掉行尾 \r\n 与空白：整行匹配标题正则，顺带修正旧版
+        // CRLF 文件因行尾 \r 不在 [\t ]* 里而匹配不上的缺陷。
+        let trimmed = line.trim_end();
+        if !trimmed.is_empty() && guard < 100_000 {
+            let whole = |m: regex::Match<'_>| m.start() == 0 && m.end() == trimmed.len();
+            // 卷先判：同一行若同时命中卷/章模式，按旧语义保留为卷。
+            let is_volume = novel_volume_res().iter().any(|re| re.find(trimmed).map(whole).unwrap_or(false));
+            let is_chapter = !is_volume
+                && novel_chapter_res().iter().any(|re| re.find(trimmed).map(whole).unwrap_or(false));
+            if is_volume || is_chapter {
                 guard += 1;
-                if guard > 100_000 {
-                    break;
-                }
-                let line = m.as_str();
-                if line.trim().is_empty() {
-                    continue;
-                }
-                marks.push(Mark {
-                    index: m.start(),
-                    len: m.as_str().len(),
-                    line: line.to_string(),
-                    is_volume,
-                });
+                marks.push((offset, offset + trimmed.len(), trimmed.to_string(), is_volume));
             }
         }
+        offset += n;
     }
-    marks.sort_by_key(|m| m.index);
-    let mut seen: HashMap<usize, ()> = HashMap::new();
-    let mut deduped: Vec<Mark> = Vec::with_capacity(marks.len());
-    for m in marks {
-        if seen.insert(m.index, ()).is_none() {
-            deduped.push(m);
-        }
+    if marks.is_empty() {
+        // 空文件回空目录；有内容但无标题则整本当一章（同旧行为）。
+        return Ok(if offset == 0 {
+            Vec::new()
+        } else {
+            vec![NovelChapterBound { name: "全文".into(), is_volume: false, start: 0, end: offset }]
+        });
     }
-    if deduped.is_empty() {
-        return vec![NovelChapterBound { name: "全文".into(), is_volume: false, start: 0, end: text.len() }];
-    }
-    let n = deduped.len();
-    (0..n)
+    let total = offset;
+    let n = marks.len();
+    Ok((0..n)
         .map(|i| {
-            let m = &deduped[i];
-            let end = if i + 1 < n { deduped[i + 1].index } else { text.len() };
+            // 正文起点 = 标题行尾（换行前），终点 = 下一标题行首；末章到文件尾。
+            let (_, start, title, is_volume) = &marks[i];
             NovelChapterBound {
-                name: m.line.trim().to_string(),
-                is_volume: m.is_volume,
-                start: m.index + m.len,
-                end,
+                name: title.clone(),
+                is_volume: *is_volume,
+                start: *start,
+                end: if i + 1 < n { marks[i + 1].0 } else { total },
             }
         })
-        .collect()
+        .collect())
 }
 
-/** 懒取（缓存）章节目录。 */
-fn novel_toc_cached(
+/** 懒取（缓存）章节目录；扫描放阻塞线程池，避免大文件冻住主线程。 */
+async fn novel_toc_cached(
     app: &tauri::AppHandle,
     state: &State<'_, ShellState>,
     name: &str,
@@ -583,21 +633,23 @@ fn novel_toc_cached(
     if let Some(hit) = state.novel_toc_cache.lock().unwrap().get(name) {
         return Ok(hit.clone());
     }
-    let text = std::fs::read_to_string(novel_path(app, name)?)
-        .map_err(|e| format!("load novel {name}: {e}"))?;
-    let chapters = split_novel_chapters(&text);
+    let path = novel_path(app, name)?;
+    let name_owned = name.to_string();
+    let chapters = tauri::async_runtime::spawn_blocking(move || scan_novel_toc(&path, &name_owned))
+        .await
+        .map_err(|e| format!("scan novel {name}: {e}"))??;
     state.novel_toc_cache.lock().unwrap().insert(name.to_string(), chapters.clone());
     Ok(chapters)
 }
 
 /** 章节目录（只回展示所需字段）。 */
 #[tauri::command]
-fn slacker_novel_toc(
+async fn slacker_novel_toc(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
     name: String,
 ) -> Result<Vec<NovelTocEntry>, String> {
-    let chapters = novel_toc_cached(&app, &state, &name)?;
+    let chapters = novel_toc_cached(&app, &state, &name).await?;
     Ok(chapters
         .iter()
         .map(|c| NovelTocEntry { name: c.name.clone(), is_volume: c.is_volume })
@@ -607,13 +659,13 @@ fn slacker_novel_toc(
 /** 读取某一章正文：按缓存字节区间 seek 定点读取，不整本读入内存。
  * 返回该章原文（未 trim），与客户端 splitChapters/getChapterText 语义一致。 */
 #[tauri::command]
-fn slacker_novel_chapter(
+async fn slacker_novel_chapter(
     app: tauri::AppHandle,
     state: State<'_, ShellState>,
     name: String,
     index: usize,
 ) -> Result<String, String> {
-    let chapters = novel_toc_cached(&app, &state, &name)?;
+    let chapters = novel_toc_cached(&app, &state, &name).await?;
     let ch = chapters
         .get(index)
         .ok_or_else(|| format!("novel {name}: chapter index {index} out of range"))?;
@@ -945,7 +997,7 @@ fn em_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
             .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
             // push2/push2his 行情域有动态风控：被临时封禁时 TCP/TLS 握手正常、
             // 请求发出 ~0.1s 内被掐断（reqwest 报 IncompleteMessage），IPv4/
             // IPv6、任意 UA/Referer 均一样，通常几分钟~几十分钟自动解封。绑
@@ -1006,14 +1058,14 @@ async fn slacker_http_fetch(
  * cleanup, 400-char chunking) lives in the tea-room frontend. */
 
 /** Zhihu-friendliness: Chrome UA + Referer/Origin/Accept/fetch marker.
- * Plain GET v3/v4 APIs need no x-zse-95/96 signatures. */
+ * Requests are additionally signed per-call via x-zse-93/96 (zhihu_sign). */
 fn zhihu_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
             .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
             .default_headers({
                 let mut h = reqwest::header::HeaderMap::new();
                 h.insert("Referer", reqwest::header::HeaderValue::from_static("https://www.zhihu.com/"));
@@ -1027,17 +1079,184 @@ fn zhihu_client() -> &'static reqwest::Client {
     })
 }
 
-/** GET with the user cookie; parses the JSON body. 401/403 maps to a
- * distinct auth error so the frontend can show the cookie banner. */
+/* ── zse96 v2 request signature ────────────────────────────────────────────
+ * Zhihu risk control 403s unsigned /api/v3|v4 calls even with a valid
+ * cookie, so every API request carries x-zse-96 = "2.0_" +
+ * encrypt(md5(zse93 + path?query + d_c0 [+ body])). Block cipher + custom
+ * base64 faithfully ported from the reference JS implementation used by
+ * zhihu-mcp-server (itself a port of the zhihu-plus-plus reverse
+ * engineering, both AGPL-3.0). Round-trip verified against that JS via
+ * the unit tests at the bottom of this file. */
+
+const ZHIHU_ZSE93: &str = "101_3_3.0";
+
+/** Round-key table of the SM4-flavoured block cipher. */
+const ZK: [u32; 32] = [
+    1170614578, 1024848638, 1413669199, 3951632832, 3528873006, 2921909214, 4151847688, 3997739139,
+    1933479194, 3323781115, 3888513386, 460404854, 3747539722, 2403641034, 2615871395, 2119585428,
+    2265697227, 2035090028, 2773447226, 4289380121, 4217216195, 2200601443, 3051914490, 1579901135,
+    1321810770, 456816404, 2903323407, 4065664991, 330002838, 3506006750, 363569021, 2347096187,
+];
+
+/** S-box of the block cipher. */
+const ZB: [u8; 256] = [
+    20, 223, 245, 7, 248, 2, 194, 209, 87, 6, 227, 253, 240, 128, 222, 91, 237, 9, 125, 157, 230,
+    93, 252, 205, 90, 79, 144, 199, 159, 197, 186, 167, 39, 37, 156, 198, 38, 42, 43, 168, 217,
+    153, 15, 103, 80, 189, 71, 191, 97, 84, 247, 95, 36, 69, 14, 35, 12, 171, 28, 114, 178, 148,
+    86, 182, 32, 83, 158, 109, 22, 255, 94, 238, 151, 85, 77, 124, 254, 18, 4, 26, 123, 176, 232,
+    193, 131, 172, 143, 142, 150, 30, 10, 146, 162, 62, 224, 218, 196, 229, 1, 192, 213, 27, 110,
+    56, 231, 180, 138, 107, 242, 187, 54, 120, 19, 44, 117, 228, 215, 203, 53, 239, 251, 127, 81,
+    11, 133, 96, 204, 132, 41, 115, 73, 55, 249, 147, 102, 48, 122, 145, 106, 118, 74, 190, 29, 16,
+    174, 5, 177, 129, 63, 113, 99, 31, 161, 76, 246, 34, 211, 13, 60, 68, 207, 160, 65, 111, 82,
+    165, 67, 169, 225, 57, 112, 244, 155, 51, 236, 200, 233, 58, 61, 47, 100, 137, 185, 64, 17, 70,
+    234, 163, 219, 108, 170, 166, 59, 149, 52, 105, 24, 212, 78, 173, 45, 0, 116, 226, 119, 136,
+    206, 135, 175, 195, 25, 92, 121, 208, 126, 139, 3, 75, 141, 21, 130, 98, 241, 40, 154, 66, 184,
+    49, 181, 46, 243, 88, 101, 183, 8, 23, 72, 188, 104, 179, 210, 134, 250, 201, 164, 89, 216,
+    202, 220, 50, 221, 152, 140, 33, 235, 214,
+];
+
+/** Custom base64 alphabet ('=' and '+' are ordinary digits here; 65 chars
+ *  in the reference — the last is never indexed, kept as-is). */
+const ZSE_ALPHABET: &[u8; 65] =
+    b"6fpLRqJO8M/c3jnYxFkUVC4ZIG12SiH=5v0mXDazWBTsuw7QetbKdoPyAl+hN9rgE";
+/** Fixed whitening key (ASCII). */
+const ZSE_KEY16: [u8; 16] = *b"059053f7d15e01d7";
+
+/** One block: 32 Feistel-ish rounds over S-box ZB + round keys ZK, output
+ *  words written back in reverse order. */
+fn zse_r_block(input: &[u8; 16]) -> [u8; 16] {
+    let mut tr = [0u32; 36];
+    for (i, w) in input.chunks_exact(4).enumerate() {
+        tr[i] = u32::from_be_bytes([w[0], w[1], w[2], w[3]]);
+    }
+    for i in 0..32 {
+        let t = tr[i + 1] ^ tr[i + 2] ^ tr[i + 3] ^ ZK[i];
+        let ti = u32::from_be_bytes([
+            ZB[(t >> 24) as usize],
+            ZB[((t >> 16) & 0xFF) as usize],
+            ZB[((t >> 8) & 0xFF) as usize],
+            ZB[(t & 0xFF) as usize],
+        ]);
+        tr[i + 4] = tr[i] ^ (ti
+            ^ ti.rotate_left(2)
+            ^ ti.rotate_left(10)
+            ^ ti.rotate_left(18)
+            ^ ti.rotate_left(24));
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&tr[35].to_be_bytes());
+    out[4..8].copy_from_slice(&tr[34].to_be_bytes());
+    out[8..12].copy_from_slice(&tr[33].to_be_bytes());
+    out[12..16].copy_from_slice(&tr[32].to_be_bytes());
+    out
+}
+
+/** CBC-ish chaining: each cipher block doubles as the next block's IV. */
+fn zse_x_blocks(data: &[u8], iv0: &[u8; 16]) -> Vec<u8> {
+    let mut iv = *iv0;
+    let mut out = vec![0u8; data.len()];
+    for (chunk, dst) in data.chunks_exact(16).zip(out.chunks_exact_mut(16)) {
+        let mut mixed = [0u8; 16];
+        for (m, (d, k)) in mixed.iter_mut().zip(chunk.iter().zip(iv.iter())) {
+            *m = d ^ k;
+        }
+        iv = zse_r_block(&mixed);
+        dst.copy_from_slice(&iv);
+    }
+    out
+}
+
+/** Custom base64: every 4th processed byte is XOR-masked with 0x3A, groups
+ *  of 3 bytes are taken from the END of the buffer, chars low-to-high. */
+fn zse_custom_encode(bytes: &[u8]) -> String {
+    let mut bytes = bytes.to_vec();
+    let rem = bytes.len() % 3;
+    if rem != 0 {
+        bytes.extend(std::iter::repeat_n(0u8, 3 - rem));
+    }
+    let mask = |i: usize| (58u32 >> (8 * (i % 4) as u32)) as u8;
+    let mut out = String::with_capacity(bytes.len() / 3 * 4);
+    let mut i = 0usize;
+    let mut p = bytes.len() as isize - 1;
+    while p >= 0 {
+        let mut v = (bytes[p as usize] ^ mask(i)) as u32;
+        i += 1;
+        v |= ((bytes[p as usize - 1] ^ mask(i)) as u32) << 8;
+        i += 1;
+        v |= ((bytes[p as usize - 2] ^ mask(i)) as u32) << 16;
+        i += 1;
+        for shift in [0u32, 6, 12, 18] {
+            out.push(ZSE_ALPHABET[((v >> shift) & 63) as usize] as char);
+        }
+        p -= 3;
+    }
+    out
+}
+
+/** Full encrypt: seed(210,0) + md5hex + PKCS-ish pad, first block whitened
+ *  with KEY16 ^ 0x2A, then chained blocks. Input is always the 32-char
+ *  lowercase md5 hex (encodeURIComponent is the identity there). */
+fn zse_encrypt_v4(md5_hex: &str) -> String {
+    let mut plain: Vec<u8> = Vec::with_capacity(48);
+    plain.push(210);
+    plain.push(0);
+    plain.extend(md5_hex.bytes());
+    let pad = 16 - plain.len() % 16;
+    plain.extend(std::iter::repeat_n(pad as u8, pad));
+    let mut first = [0u8; 16];
+    for (f, (p, k)) in first.iter_mut().zip(plain.iter().zip(ZSE_KEY16.iter())) {
+        *f = p ^ k ^ 42;
+    }
+    let c0 = zse_r_block(&first);
+    let mut cipher = vec![0u8; plain.len()];
+    cipher[0..16].copy_from_slice(&c0);
+    cipher[16..].copy_from_slice(&zse_x_blocks(&plain[16..], &c0));
+    zse_custom_encode(&cipher)
+}
+
+/** Pull the d_c0 value out of the raw Cookie header string ("" if absent;
+ *  the reference still signs with an empty d_c0, so keep that behaviour). */
+fn zhihu_d_c0(cookie: &str) -> &str {
+    for part in cookie.split(';') {
+        if let Some(v) = part.trim().strip_prefix("d_c0=") {
+            return v;
+        }
+    }
+    ""
+}
+
+/** x-zse-96 = "2.0_" + encrypt(md5(zse93 + path?query + d_c0 [+ body])). */
+fn zhihu_sign(url: &str, dc0: &str, body: Option<&str>) -> String {
+    // path?query = everything after the host (string split, like the ref).
+    let after = url.split("//").nth(1).unwrap_or(url);
+    let path_query = format!("/{}", after.splitn(2, '/').nth(1).unwrap_or(""));
+    let mut source = format!("{ZHIHU_ZSE93}+{path_query}+{dc0}");
+    if let Some(b) = body {
+        source.push('+');
+        source.push_str(b);
+    }
+    let digest = format!("{:x}", md5::compute(source.as_bytes()));
+    format!("2.0_{}", zse_encrypt_v4(&digest))
+}
+
+/** GET with the user cookie + request signature; parses the JSON body.
+ *  Only 401 maps to the distinct auth error (frontend shows the cookie
+ *  banner); 403 would mean risk control / signature mismatch, NOT a dead
+ *  cookie, so it stays a plain error instead of nagging the user. */
 async fn zhihu_get(url: &str, cookie: &str) -> Result<serde_json::Value, String> {
+    let sig = zhihu_sign(url, zhihu_d_c0(cookie), None);
     let resp = zhihu_client().get(url)
         .header("Cookie", cookie)
+        .header("x-zse-93", ZHIHU_ZSE93)
+        .header("x-zse-96", sig)
         .send().await
         .map_err(|e| format!("zhihu http: {e:?}"))?;
     let status = resp.status();
     let bytes = resp.bytes().await.map_err(|e| format!("zhihu body: {e}"))?;
-    if status.as_u16() == 401 || status.as_u16() == 403 {
-        return Err(format!("ZHIHU_AUTH HTTP {status}: cookie 已失效，请更新 Cookie"));
+    match status.as_u16() {
+        401 => return Err("ZHIHU_AUTH HTTP 401: cookie 已失效，请更新 Cookie".into()),
+        403 => return Err("zhihu http 403: 知乎风控拦截（非 Cookie 失效），请稍后再试".into()),
+        _ => {}
     }
     let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("zhihu json: {e}"))?;
@@ -1087,6 +1306,27 @@ async fn slacker_zhihu_content(
     zhihu_get(&url, &cookie).await
 }
 
+/** One page of root comments for one feed target (raw API JSON passthrough:
+ * `{ data: [...], paging: { is_end, ... } }`). `offset` is the item offset
+ * of this page (0 for the first). */
+#[tauri::command]
+async fn slacker_zhihu_comments(
+    kind: String,
+    target_id: String,
+    cookie: String,
+    offset: u32,
+    limit: u32,
+) -> Result<serde_json::Value, String> {
+    let base = match kind.as_str() {
+        "answer" => format!("https://www.zhihu.com/api/v4/answers/{target_id}/root_comments"),
+        "article" => format!("https://www.zhihu.com/api/v4/articles/{target_id}/root_comments"),
+        "pin" => format!("https://www.zhihu.com/api/v4/pins/{target_id}/root_comments"),
+        other => return Err(format!("unsupported zhihu comments kind: {other}")),
+    };
+    let url = format!("{base}?offset={offset}&limit={limit}&order=normal&status=open");
+    zhihu_get(&url, &cookie).await
+}
+
 /** Fire-and-forget "already read" feedback so the feed stops repeating.
  * Returns success only on HTTP 2xx; the frontend trips a breaker after 3
  * consecutive failures and stops reporting for the session. */
@@ -1096,11 +1336,18 @@ async fn slacker_zhihu_report_read(
     cookie: String,
 ) -> Result<bool, String> {
     let payload = serde_json::json!({ "read_data_list": items });
+    let body = payload.to_string();
+    let sig = zhihu_sign(
+        "https://www.zhihu.com/api/v3/feed/topstory/feedback/read",
+        zhihu_d_c0(&cookie), Some(&body),
+    );
     let resp = zhihu_client()
         .post("https://www.zhihu.com/api/v3/feed/topstory/feedback/read")
         .header("Cookie", cookie)
+        .header("x-zse-93", ZHIHU_ZSE93)
+        .header("x-zse-96", sig)
         .header("Content-Type", "application/json")
-        .body(payload.to_string())
+        .body(body)
         .send().await
         .map_err(|e| format!("zhihu read http: {e:?}"))?;
     Ok(resp.status().is_success())
@@ -1110,6 +1357,49 @@ async fn slacker_zhihu_report_read(
 #[tauri::command]
 async fn slacker_zhihu_me(cookie: String) -> Result<serde_json::Value, String> {
     zhihu_get("https://www.zhihu.com/api/v4/me", &cookie).await
+}
+
+/** Proxy-fetch a zhimg image and return it as a data URL. WebView-side
+ * loads of pic*.zhimg.com get cut by anti-hotlinking/risk control (every
+ * image ends up hidden), so we fetch with the same browser-ish client as
+ * the APIs (Cookie + Referer + full UA) and inline the bytes instead. */
+#[tauri::command]
+async fn slacker_zhihu_image(url: String, cookie: String) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(&url).map_err(|_| format!("bad image url: {url}"))?;
+    let host = parsed.host_str().unwrap_or("").to_string();
+    // Only the zhimg CDN: keeps this command from becoming an SSRF gadget.
+    if host != "zhimg.com" && !host.ends_with(".zhimg.com") {
+        return Err(format!("not a zhimg host: {host}"));
+    }
+    let resp = zhihu_client().get(parsed)
+        .header("Cookie", cookie)
+        .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+        .send().await
+        .map_err(|e| format!("zhihu image http: {e:?}"))?;
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .split(';')
+        .next()
+        .unwrap_or("image/jpeg")
+        .trim()
+        .to_ascii_lowercase();
+    let bytes = resp.bytes().await.map_err(|e| format!("zhihu image body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("zhihu image HTTP {status}: {host}"));
+    }
+    if !ctype.starts_with("image/") {
+        return Err(format!("zhihu image not an image: {ctype}"));
+    }
+    // Cap at 10 MB so a huge original cannot blow up the IPC channel.
+    if bytes.len() > 10 * 1024 * 1024 {
+        return Err("zhihu image too large".into());
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{ctype};base64,{b64}"))
 }
 
 /** encodeURIComponent for a single query value (ASCII-safe superset). */
@@ -1185,7 +1475,9 @@ async fn slacker_tea_window(
 
 /* ── slacker novel window: the reader as its own silent window ──
  * Now loads a standalone HTML (novel.html) that mounts NovelView directly.
- * Book data is passed via Tauri event 'slacker:novel-open' after window creation. */
+ * On creation the book is injected via an initialization script
+ * (window.__SLACKER_NOVEL_BOOK__, document_start); an existing window
+ * switches books via the 'slacker:novel-open' event instead. */
 
 /// Open (create+fill or focus+retarget) / close the novel reader window.
 /// @param action - "open": create or focus; "close": close if open.
@@ -1222,6 +1514,31 @@ async fn slacker_novel_window(
     }
     use tauri::webview::WebviewWindowBuilder;
     use tauri::WebviewUrl;
+    // 带书开窗：书目用 initialization_script 在 document_start 注入（早于页面
+    // 任何脚本），替代旧的「sleep 500ms 再 emit」——那个兜底偶尔赶不上监听。
+    let book_json = book
+        .as_ref()
+        .and_then(|b| serde_json::to_string(b).ok())
+        .unwrap_or_else(|| "null".into());
+    let init_script = format!(
+        "(function () {{
+            if (window.top !== window) return;
+            // 资产缺失时 webview 会回落到 index.html（茶水间首页）；自愈跳回阅读页。
+            if (!/novel\\.html$/.test(location.pathname)) {{
+                if (!sessionStorage.getItem('__slackerNovelRetry')) {{
+                    sessionStorage.setItem('__slackerNovelRetry', '1');
+                    location.replace('novel.html');
+                }}
+                return;
+            }}
+            window.__SLACKER_NOVEL_BOOK__ = {book_json};
+        }})();"
+    );
+    // 新窗口从正常阅读形态开始：清掉上一轮残留的浮条状态
+    // （return_pos 不清，保留「拖到哪下次开回来还是哪」的跨窗记忆）。
+    *state.novel_was_floating.lock().unwrap() = false;
+    *state.novel_float_prev_pos.lock().unwrap() = None;
+    *state.novel_float_prev_size.lock().unwrap() = None;
     let _win = WebviewWindowBuilder::new(&app, "novel-reader", WebviewUrl::App("novel.html".into()))
         .title("阅读")
         .inner_size(500.0, 760.0)
@@ -1232,21 +1549,12 @@ async fn slacker_novel_window(
         .shadow(false)
         // 悬浮小窗（浮条皮肤）需要透出底层工作软件；页面根背景由 NovelView 兜底。
         .transparent(true)
+        .initialization_script(&init_script)
         .build()
         .map_err(|e| {
             eprintln!("[slacker] build novel window failed: {e}");
             format!("build novel window: {e}")
         })?;
-    // 窗口创建后，若带书则发事件让 NovelView 打开。
-    // 新建窗口的页面导航是异步的，立即 emit 会赶在 NovelView 挂载监听前
-    // 到达而被丢弃；延迟一小段（本地页面导航耗时远小于该值）确保监听已就绪。
-    if let Some(b) = book {
-        let app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = app.emit_to("novel-reader", "slacker:novel-open", b);
-        });
-    }
     println!("[slacker] novel window created");
     Ok("created".into())
 }
@@ -1524,8 +1832,10 @@ pub fn run() {
             slacker_stock_mini,
             slacker_zhihu_feed,
             slacker_zhihu_content,
+            slacker_zhihu_comments,
             slacker_zhihu_report_read,
             slacker_zhihu_me,
+            slacker_zhihu_image,
             slacker_http_fetch,
             slacker_tea_window,
             slacker_novel_window,
@@ -1557,4 +1867,41 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod zse96_tests {
+    use super::*;
+
+    /** Golden values generated with the reference JS implementation
+     *  (zse-signer.js from zhihu-mcp-server, a zhihu-plus-plus port) run
+     *  under node; guards the hand-ported cipher against regressions. */
+    #[test]
+    fn zse96_matches_reference_js() {
+        assert_eq!(
+            zse_encrypt_v4("848951efd31705cb9bcbd5251310516a"),
+            "kvD4f6R8CYndvScnkVe2uQPcc3QiLwzACx6skQyfOjRQZC9BPv4agkhnuy6pxn9Z"
+        );
+        assert_eq!(
+            zhihu_sign(
+                "https://www.zhihu.com/api/v4/feed/topstory/recommend?limit=6&after_id=0",
+                "AbC.123|456|xyz=", None,
+            ),
+            "2.0_XFOy1FkR=6r/yHkZoZhK1NeWnoN/OFrfc=bt3DdAuqQlMHbX9vbhQ+8fGQwOZrkl"
+        );
+        assert_eq!(
+            zhihu_sign(
+                "https://www.zhihu.com/api/v3/feed/topstory/feedback/read",
+                "AbC.123|456|xyz=", Some(r#"{"read_data_list":[]}"#),
+            ),
+            "2.0_eMMW/iN38v6zlBiXOVznVWBy3=2Ch4lnKnyBJGJCMgZ4P5n0C+5ikTG3ZlSn=1SD"
+        );
+    }
+
+    #[test]
+    fn d_c0_extraction() {
+        assert_eq!(zhihu_d_c0("a=1; d_c0=AbC.123|456|xyz=; z_c0=zz"), "AbC.123|456|xyz=");
+        assert_eq!(zhihu_d_c0("d_c0=lead"), "lead");
+        assert_eq!(zhihu_d_c0("no_cookie_here"), "");
+    }
 }

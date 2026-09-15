@@ -34,6 +34,8 @@ regex = "1"
 anyhow = "=1.0.102"
 # Native folder-picker for the novel download directory setting.
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+# Zhihu x-zse-96 request signature: md5(sign source) feeds the block cipher.
+md5 = "0.7"
 
 [profile.dev]
 # rustc 1.97.1 (x86_64-pc-windows-gnu) 在增量编译下会随机触发

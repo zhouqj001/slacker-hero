@@ -1,0 +1,9 @@
+{
+  "name": "slacker-dsh-runtime",
+  "private": true,
+  "version": "0.0.0",
+  "description": "npm-installed dsh web runtime consumed by the slacker shell (shell/src-tauri/src/lib.rs DSH_BIN). node_modules is gitignored; restore with: npm install",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.2"
+  }
+}

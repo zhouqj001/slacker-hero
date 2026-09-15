@@ -23,6 +23,12 @@ data/
 temp/
 *.tmp
 
+# ---- 本地运行时状态 (dsh home: token/workbench SQLite/stderr 日志等) ----
+.dsh-dev/
+
+# ---- 第三方 monorepo 快照 (方案A后零引用, 仅本地参考, 不入库) ----
+vendor/deepseek-harness/
+
 # ---- 环境变量 ----
 .env
 .env.*

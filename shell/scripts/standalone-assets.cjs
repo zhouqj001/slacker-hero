@@ -32,6 +32,7 @@ if (!fs.existsSync(vendorDir)) {
 }
 
 const copies = [
+  { src: path.join(htmlSrc, 'index.html'),      dest: path.join(ui, 'index.html') },
   { src: path.join(htmlSrc, 'tea.html'),       dest: path.join(ui, 'tea.html') },
   { src: path.join(htmlSrc, 'novel.html'),     dest: path.join(ui, 'novel.html') },
   { src: path.join(htmlSrc, 'stock-mini.html'), dest: path.join(ui, 'stock-mini.html') },

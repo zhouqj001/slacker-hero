@@ -38,8 +38,8 @@ commands.allow = ["slacker_stock_quotes", "slacker_stock_search", "slacker_stock
 
 [[permission]]
 identifier = "allow-slacker-zhihu"
-description = "Thin proxy for the Zhihu recommendation feed (feed page/content/read-feedback/me validation; cookie supplied per-call by the tea room)"
-commands.allow = ["slacker_zhihu_feed", "slacker_zhihu_content", "slacker_zhihu_report_read", "slacker_zhihu_me"]
+description = "Thin proxy for the Zhihu recommendation feed (feed page/content/comments/read-feedback/me validation/image proxy; cookie supplied per-call by the tea room)"
+commands.allow = ["slacker_zhihu_feed", "slacker_zhihu_content", "slacker_zhihu_comments", "slacker_zhihu_report_read", "slacker_zhihu_me", "slacker_zhihu_image"]
 
 [[permission]]
 identifier = "allow-slacker-http"

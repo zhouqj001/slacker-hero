@@ -24,7 +24,11 @@ export type SlackerKey =
   | 'zhihu.loadMore'
   | 'zhihu.empty'
   | 'zhihu.readAll'
-  | 'zhihu.back'
+  | 'zhihu.collapse'
+  | 'zhihu.comments'
+  | 'zhihu.commentsEmpty'
+  | 'zhihu.commentsMore'
+  | 'zhihu.commentsFail'
   | 'zhihu.images'
   | 'zhihu.imgHidden'
   | 'zhihu.reset'
@@ -123,7 +127,11 @@ export const zh = {
   'zhihu.loadMore': '继续刷',
   'zhihu.empty': '没有新内容了，稍后再来',
   'zhihu.readAll': '展开全文',
-  'zhihu.back': '返回列表',
+  'zhihu.collapse': '收起',
+  'zhihu.comments': '评论',
+  'zhihu.commentsEmpty': '还没有评论',
+  'zhihu.commentsMore': '更多评论',
+  'zhihu.commentsFail': '评论加载失败',
   'zhihu.images': '图',
   'zhihu.imgHidden': '图片已隐藏',
   'zhihu.reset': '换一批',
@@ -223,7 +231,11 @@ export const en = {
   'zhihu.loadMore': 'More',
   'zhihu.empty': 'Nothing new for now',
   'zhihu.readAll': 'Read more',
-  'zhihu.back': 'Back to list',
+  'zhihu.collapse': 'Collapse',
+  'zhihu.comments': 'Comments',
+  'zhihu.commentsEmpty': 'No comments yet',
+  'zhihu.commentsMore': 'More comments',
+  'zhihu.commentsFail': 'Failed to load comments',
   'zhihu.images': 'Img',
   'zhihu.imgHidden': 'Image hidden',
   'zhihu.reset': 'Refresh',

@@ -277,6 +277,15 @@ export async function zhihuContent(kind: string, targetId: string, cookie: strin
   return invoke('slacker_zhihu_content', { kind, targetId, cookie })
 }
 
+/** One root-comments page of one target (raw API JSON: { data, paging }). */
+export async function zhihuComments(
+  kind: string, targetId: string, cookie: string, offset: number, limit: number,
+): Promise<unknown> {
+  const invoke = shellInvoke()
+  if (invoke === undefined) throw new Error('zhihu comments needs the shell proxy')
+  return invoke('slacker_zhihu_comments', { kind, targetId, cookie, offset, limit })
+}
+
 /** Batch "already read" feedback; resolves false on any failure (caller
  * trips a breaker after 3 consecutive failures). */
 export async function zhihuReportRead(items: unknown[], cookie: string): Promise<boolean> {
@@ -291,6 +300,14 @@ export async function zhihuMe(cookie: string): Promise<unknown> {
   const invoke = shellInvoke()
   if (invoke === undefined) throw new Error('zhihu me needs the shell proxy')
   return invoke('slacker_zhihu_me', { cookie })
+}
+
+/** Proxy-fetch one zhimg image; resolves a data URL (Rust side attaches
+ * Cookie + browser-ish headers, sidestepping WebView hotlink blocks). */
+export async function zhihuImage(url: string, cookie: string): Promise<string> {
+  const invoke = shellInvoke()
+  if (invoke === undefined) throw new Error('zhihu image needs the shell proxy')
+  return invoke<string>('slacker_zhihu_image', { url, cookie })
 }
 
 /** Whether an IPC error message is the shell's auth-failure marker. */

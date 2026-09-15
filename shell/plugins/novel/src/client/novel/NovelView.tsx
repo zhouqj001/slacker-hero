@@ -577,20 +577,24 @@ export function NovelView(props: NovelViewProps): JSX.Element {
     }
   }, [settings.autoStealth])
 
-  /* 悬浮细条：悬皮肤生效/退出时收展小窗、切换鼠标穿透（仅壳内）。
-     设置未载入前不动作，防重载/首挂瞬间发一次「退出悬浮」把窗口撑大。 */
-  const floatMode = effectiveSkin === 'float'
+  /* 窗口形态（仅壳内）：float=悬浮细条；dark=大窗；其余=默认小窗。
+     旧版拆成两个 effect（悬浮收窗 + 尺寸调整），settingsReady 翻转/换肤时
+     两者同帧先后触发、互相把窗口改回去（悬浮条被撑回大窗）。合成一个
+     shape effect：一次只走一个动作，float 态绝不再补 resize。 */
+  const shape: 'float' | 'wide' | 'normal' =
+    effectiveSkin === 'float' ? 'float' : effectiveSkin === 'dark' ? 'wide' : 'normal'
+  // 初值：独立阅读窗记 null（挂载即应用目标形态）；嵌在茶水间/主窗里则
+  // 记当前值（首挂不发窗口指令，防把窗口撑大），仅形态变化时才动作。
+  const shapeRef = useRef<'float' | 'wide' | 'normal' | null>(NOVEL_MODE ? null : shape)
   useEffect(() => {
     if (!inShell() || !settingsReady) return
-    void novelFloatMode(floatMode)
-  }, [floatMode, settingsReady])
-
-  /* 暗色皮肤：切大窗（全屏黑底纯正文，遮挡感强）；其他皮肤切回默认小窗。 */
-  const bigWindow = effectiveSkin === 'dark'
-  useEffect(() => {
-    if (!inShell() || !settingsReady) return
-    void novelWindowResize(bigWindow)
-  }, [bigWindow, settingsReady])
+    const prev = shapeRef.current
+    if (prev === shape) return
+    shapeRef.current = shape
+    if (shape === 'float') { void novelFloatMode(true); return }
+    if (prev === 'float') void novelFloatMode(false)
+    void novelWindowResize(shape === 'wide')
+  }, [shape, settingsReady])
 
   /* 进度防抖 800ms 落盘（同原作 saveProgress）。*/
   const saveTimer = useRef<number | undefined>(undefined)
@@ -980,6 +984,17 @@ await novelSave(next.book.name, parts.join('\n'))
       </div>
     </div>
   )
+
+  /* 无书态（独立阅读窗开局/等书时）也要能 ESC 关窗：主键盘 effect 在
+     reading===null 时不挂监听，曾导致回落页/空窗按 ESC 无反应。 */
+  useEffect(() => {
+    if (!NOVEL_MODE || reading !== null) return
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === 'Escape') void novelWindowClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [reading])
 
   /* 键盘（同原作键位）。 */
   useEffect(() => {

@@ -218,4 +218,4 @@ node shell/scripts/standalone-assets.cjs
 
 ## 许可证
 
-[MIT](LICENSE)
+[AGPL-3.0](./LICENSE)

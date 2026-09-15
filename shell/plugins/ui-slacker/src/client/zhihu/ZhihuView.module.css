@@ -4,6 +4,7 @@
 .root {
   align-self: stretch;
   width: 100%;
+  height: 100%;
   max-width: 680px;
   margin: 0 auto;
   display: flex;
@@ -16,8 +17,9 @@
   from { opacity: 0; transform: translateY(8px); }
 }
 
-/* 头部：标题 + 工具 pills */
+/* 头部：标题 + 工具 pills（固定在布局里，只有下方列表滚动） */
 .head {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -28,11 +30,15 @@
 .spacer { flex: 1; }
 
 .pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 12px;
   border: none;
-  border-radius: 999px;
-  padding: 4px 11px;
+  border-radius: 8px;
   cursor: pointer;
-  font-size: 11.5px;
+  font-size: 12px;
   flex: none;
   color: var(--pa-text2);
   background: var(--pa-bg3);
@@ -46,16 +52,18 @@
   box-shadow: inset 0 0 0 1px var(--pa-warmline-soft);
 }
 
-.pillOn {
-  color: var(--pa-bg2);
-  background: var(--pa-warmline);
-  box-shadow: none;
+/* 图片开关的状态圆点：关=半透明，开=实心 */
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+  flex: none;
 }
 
-.pillOn:hover {
-  color: var(--pa-bg2);
-  background: var(--pa-warmline);
-}
+/* 图片开关：不加视觉差异，仅状态圆点实心/半透明区分开与关 */
+.pillOn .dot { opacity: 1; }
 
 /* Cookie 失效横幅：被动展示，不抢焦点 */
 .banner {
@@ -143,28 +151,36 @@
 
 /* ── 卡片流 ── */
 
+/* 列表是唯一滚动区：头部/editor 固定，滚动条只出现在这里 */
 .list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--pa-line2) transparent;
+  padding-right: 2px;
 }
 
-.card {
+.list::-webkit-scrollbar { width: 6px; }
+
+.list::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+  background: var(--pa-line2);
+}
+
+/* 一条动态的视觉容器：卡片 +（展开时的）详情共用同一层底色与圆环 */
+.item {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  width: 100%;
-  text-align: left;
-  padding: 11px 14px;
-  border: none;
   border-radius: 14px;
-  cursor: pointer;
-  font: inherit;
   background: linear-gradient(165deg,
     color-mix(in srgb, var(--pa-cream) 4%, var(--pa-bg2)),
     var(--pa-bg2) 55%);
   box-shadow: inset 0 0 0 1px var(--pa-line);
-  color: inherit;
   transition: box-shadow 0.15s, transform 0.15s;
   animation: cardIn 0.25s ease both;
 }
@@ -173,11 +189,33 @@
   from { opacity: 0; transform: translateY(6px); }
 }
 
-.card:hover {
+.item:hover {
   transform: translateY(-1px);
   box-shadow:
     inset 0 0 0 1px var(--pa-warmline),
     0 6px 18px -8px rgba(0, 0, 0, 0.45);
+}
+
+/* 展开中：保持平铺并亮边，指明详情归属 */
+.itemOpen,
+.itemOpen:hover {
+  transform: none;
+  box-shadow: inset 0 0 0 1px var(--pa-warmline-soft);
+}
+
+/* 卡片按钮：透明 chrome，视觉由 .item 承担 */
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  padding: 11px 14px;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  background: none;
+  color: inherit;
 }
 
 .cardMeta {
@@ -237,16 +275,13 @@
 
 /* ── 就地详情 ── */
 
+/* 详情不是独立盒子：与卡片同处 .item 内，仅以分隔线区隔 */
 .detail {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 14px;
-  border-radius: 14px;
-  background: linear-gradient(165deg,
-    color-mix(in srgb, var(--pa-cream) 4%, var(--pa-bg2)),
-    var(--pa-bg2) 55%);
-  box-shadow: inset 0 0 0 1px var(--pa-line);
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--pa-line);
   animation: detailIn 0.22s ease both;
 }
 
@@ -305,6 +340,14 @@
   margin: 8px 0;
 }
 
+/* 图片代理加载中的灰占位（先占高度，出图时不跳动） */
+.imgLoad {
+  margin: 8px 0;
+  height: 72px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--pa-cream) 3%, transparent);
+}
+
 .imgHidden {
   display: block;
   margin: 8px 0;
@@ -314,4 +357,98 @@
   color: var(--pa-text3);
   border-radius: 10px;
   background: color-mix(in srgb, var(--pa-cream) 3%, transparent);
+}
+
+/* ── 评论区（详情底部） ── */
+
+.comments {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--pa-line);
+}
+
+/* 评论头是展开/收起按钮 */
+.commentsHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 2px 0;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--pa-cream);
+  transition: color 0.15s;
+}
+
+.commentsHead:hover { color: var(--pa-warmline); }
+
+.commentsHead:hover .commentsArrow { color: var(--pa-warmline); }
+
+.commentsArrow {
+  font-size: 10px;
+  color: var(--pa-text3);
+  transition: color 0.15s;
+}
+
+.commentsCount {
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 17px;
+  color: var(--pa-text2);
+  background: var(--pa-bg3);
+}
+
+.comment {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--pa-cream) 3%, transparent);
+}
+
+/* 楼中楼：嵌套缩进 */
+.comment .comment { margin-left: 14px; }
+
+.commentHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.commentAuthor {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--pa-cream);
+}
+
+.commentMeta {
+  min-width: 0;
+  font: 10px ui-monospace, monospace;
+  color: var(--pa-text3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.commentBody {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--pa-text2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.more:disabled {
+  opacity: 0.55;
+  cursor: default;
 }

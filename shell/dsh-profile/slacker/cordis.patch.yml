@@ -1,0 +1,14 @@
+# slacker-hero profile patch: the leisure-zone client plugins join the
+# browser roster on top of the stock dsh-web-app bundle. Upstream files stay
+# untouched so vendor upgrades stay conflict-free. The plugins live in
+# shell/plugins/* (installed into the profile via the file: deps in
+# package.json) — these rows only mount them into the browser roster.
+#
+# Default community plugins (e.g. dshmarket) need no insert row here: they
+# ship their own dsh.bundle.patch which composes its own insert once the
+# package is listed in dsh.profile.bundles + dependencies (see package.json).
+- insert:
+    - id: novel
+      name: '@slacker/novel'
+    - id: ui-slacker
+      name: '@slacker/ui-slacker'

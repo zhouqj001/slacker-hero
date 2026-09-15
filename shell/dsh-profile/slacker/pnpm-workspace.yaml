@@ -1,0 +1,16 @@
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+# pnpm >= 10.13 reads overrides from this file (package.json "pnpm" field is
+# ignored since pnpm 11); must stay in sync with pnpm-lock.yaml's overrides.
+overrides:
+  '@deepseek-ai/dsh-tools': 0.1.5-rc.2
+# pnpm >= 10 blocks dependency build scripts by default (pnpm 11 fails the
+# install outright); node-pty needs its node-gyp build for the terminal.
+# pnpm 11: allowBuilds replaced onlyBuiltDependencies/ignoredBuiltDependencies.
+allowBuilds:
+  node-pty: true
+minimumReleaseAgeExclude:
+  - "dshmarket@1.45.0"
