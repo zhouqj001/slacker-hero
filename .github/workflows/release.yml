@@ -1,0 +1,80 @@
+name: Release
+
+# 推送 v* tag 触发：四平台构建安装包并自动发布 GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    permissions:
+      contents: write # 创建 Release 并上传产物
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64：NSIS + MSI 全出
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extra: ''
+          # Windows ARM64：x64 runner 交叉编译（runner 自带 MSVC ARM64 工具链）
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            extra: '--bundles nsis' # WiX(MSI) 对 ARM64 支持不稳，只出 NSIS 安装器
+          # macOS：单 job 出 Apple Silicon + Intel 通用包
+          - os: macos-latest
+            target: universal-apple-darwin
+            extra: ''
+          # Linux 桌面：AppImage + deb
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            extra: ''
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # universal 目标需要 x64 + arm64 两份 std
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ contains(matrix.target, 'universal') && 'aarch64-apple-darwin x86_64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell/src-tauri
+          key: ${{ matrix.target }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装 Linux 系统依赖 (WebKitGTK / 托盘 / AppImage 工具)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libfuse2
+
+      # 前端插件 tsdown bundle + 同步到 shell/ui（tauri 的 beforeBuildCommand 只做同步，不打插件）
+      - name: 安装依赖并打包前端插件
+        run: |
+          npm install
+          npm run setup
+
+      - name: 构建并发布
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: shell
+          tauriScript: npx tauri
+          args: --target ${{ matrix.target }} ${{ matrix.extra }}
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Slacker Shell ${{ github.ref_name }}'
+          releaseBody: '跨平台安装包：Windows x64 / ARM64 · macOS（Apple Silicon + Intel 通用）· Linux（AppImage + deb）。安装包均未签名：Windows 首次运行如遇 SmartScreen 请选择「仍要运行」；macOS 请右键打开或执行 `xattr -cr /Applications/slacker-shell.app`。'
+          releaseDraft: false
+          prerelease: false
