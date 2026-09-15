@@ -1,7 +1,7 @@
 {
   "name": "slacker-shell",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Tauri 2 desktop shell: tea-break zone, stock quotes, novel reader and mini games",
   "scripts": {
     "shell": "cd shell && npx tauri dev",
