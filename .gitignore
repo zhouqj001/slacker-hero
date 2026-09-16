@@ -18,6 +18,9 @@ shell/src-tauri/gen/
 # ---- Tauri 运行时前端资源 (standalone-assets.cjs 从 resources + 插件 lib 生成) ----
 shell/ui/
 
+# ---- 安装包内置运行时 zip (pack-runtime.cjs 生成, 入 tauri resources) ----
+shell/src-tauri/resources/runtime/
+
 # ---- 运行数据 / 临时文件 ----
 data/
 temp/
@@ -39,6 +42,9 @@ vendor/deepseek-harness/
 .idea/
 *.swp
 .DS_Store
+
+logs/
+logs/*
 
 # ==== 注意 ====
 # shell/src-tauri/Cargo.lock 有意提交(可复现构建/快速增量)

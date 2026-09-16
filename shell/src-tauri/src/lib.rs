@@ -64,21 +64,172 @@ fn free_port() -> u16 {
         .unwrap_or(3199)
 }
 
-/**
- * Spawn the dsh web server and return its tokenized URL.
- * The URL line ("dsh web: http://…?token=…") is parsed from stdout; newer
- * dsh may append " (LAN: http://…)" to the line, so only the first token
- * is taken as the URL.
- */
-fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
-    let port = free_port();
-    let repo_root = app
+/** Resolved dsh runtime: node executable, entry script, spawn cwd, DSH_HOME. */
+struct DshRuntime {
+    node: std::path::PathBuf,
+    dsh_bin: std::path::PathBuf,
+    dsh_cwd: std::path::PathBuf,
+    home: std::path::PathBuf,
+}
+
+/** Recursive directory copy (packaged profile sync). */
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)
+                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/** Extract the bundled runtime zip into <local_data>/dsh/runtime. Idempotent:
+ * the .version marker short-circuits; a version bump wipes and re-extracts
+ * (dsh state lives in the sibling home/ and survives the upgrade). */
+fn extract_packaged_runtime(
+    app: &tauri::AppHandle,
+    zip_path: &std::path::Path,
+    runtime_dir: &std::path::Path,
+) -> Result<(), String> {
+    let version = app.package_info().version.to_string();
+    let marker = runtime_dir.join(".version");
+    if std::fs::read_to_string(&marker)
+        .map(|v| v == version)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if runtime_dir.exists() {
+        std::fs::remove_dir_all(runtime_dir).map_err(|e| format!("clean old runtime: {e}"))?;
+    }
+    std::fs::create_dir_all(runtime_dir).map_err(|e| format!("create runtime dir: {e}"))?;
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("open runtime zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("read runtime zip: {e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        let out = runtime_dir.join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("zip mkdir {}: {e}", rel.display()))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("zip mkdir {}: {e}", rel.display()))?;
+        }
+        let mut out_file = std::fs::File::create(&out)
+            .map_err(|e| format!("zip create {}: {e}", rel.display()))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .map_err(|e| format!("zip write {}: {e}", rel.display()))?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
+        }
+    }
+    std::fs::write(&marker, &version).map_err(|e| format!("write runtime marker: {e}"))?;
+    Ok(())
+}
+
+/** Runtime from the installer bundle (pack-runtime.cjs zip under resources):
+ * embedded node + dsh runtime + pre-installed profile — zero machine deps
+ * (no system node/pnpm, no junctions, no network). None when the zip is
+ * absent, i.e. `tauri dev`, which keeps using the repo checkout. */
+fn packaged_runtime(app: &tauri::AppHandle) -> Option<Result<DshRuntime, String>> {
+    let zip_path = app
         .path()
         .resource_dir()
-        .ok()
-        .and_then(|_| None::<std::path::PathBuf>)
-        .unwrap_or_default();
-    let _ = repo_root;
+        .ok()?
+        // resources keep their src-tauri-relative layout in the bundle:
+        // resources/runtime/dsh-runtime.zip -> $RESOURCE/resources/runtime/...
+        .join("resources")
+        .join("runtime")
+        .join("dsh-runtime.zip");
+    if !zip_path.exists() {
+        return None;
+    }
+    Some((|| {
+        let base = app
+            .path()
+            .app_local_data_dir()
+            .map_err(|e| format!("app local data dir: {e}"))?
+            .join("dsh");
+        let runtime_dir = base.join("runtime");
+        extract_packaged_runtime(app, &zip_path, &runtime_dir)?;
+
+        // DSH_HOME persists across upgrades; only the slacker profile layer
+        // re-syncs from the extracted pristine copy when the version moves.
+        let home = base.join("home");
+        let profile_dst = home.join("profiles").join("slacker");
+        let profile_marker = home.join("profiles").join(".profile-version");
+        let version = app.package_info().version.to_string();
+        let fresh = profile_dst.join("node_modules").exists()
+            && std::fs::read_to_string(&profile_marker)
+                .map(|v| v == version)
+                .unwrap_or(false);
+        if !fresh {
+            if profile_dst.exists() {
+                std::fs::remove_dir_all(&profile_dst)
+                    .map_err(|e| format!("clean old profile: {e}"))?;
+            }
+            copy_dir_recursive(&runtime_dir.join("profiles").join("slacker"), &profile_dst)?;
+            std::fs::create_dir_all(home.join("profiles"))
+                .map_err(|e| format!("create profiles dir: {e}"))?;
+            std::fs::write(&profile_marker, &version)
+                .map_err(|e| format!("write profile marker: {e}"))?;
+        }
+
+        // Bundled node: Windows always ships x64 (runs under ARM emulation,
+        // dodging cross-arch npm optional deps); the mac zip carries both.
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let node_rel: String = match std::env::consts::OS {
+            "windows" => "node/win32-x64/node.exe".into(),
+            "macos" => format!("node/darwin-{arch}/bin/node"),
+            _ => format!("node/linux-{arch}/bin/node"),
+        };
+        let node = runtime_dir.join(node_rel);
+        if !node.exists() {
+            return Err(format!("bundled node missing: {}", node.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755));
+        }
+        let dsh_bin = runtime_dir
+            .join("dsh")
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        if !dsh_bin.exists() {
+            return Err(format!("bundled dsh runtime missing: {}", dsh_bin.display()));
+        }
+        Ok(DshRuntime {
+            node,
+            dsh_bin,
+            dsh_cwd: runtime_dir.join("dsh"),
+            home,
+        })
+    })())
+}
+
+/** Dev-checkout runtime: repo layout discovered from cwd (shell/src-tauri),
+ * junction-mapped plugins and a pnpm-installed profile under .dsh-dev. */
+fn dev_runtime() -> Result<DshRuntime, String> {
     // Dev shape: cwd is the src-tauri dir; resolve the repo root from there.
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let repo_root = cwd
@@ -164,17 +315,34 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     // The runtime's node_modules is gitignored; a fresh clone without the
     // one-time `npm install` in vendor/dsh-runtime would otherwise fail with
     // a cryptic MODULE_NOT_FOUND inside dsh's stderr log after a 60s timeout.
-    if !repo_root.join(DSH_BIN).exists() {
+    let dsh_bin = repo_root.join(DSH_BIN);
+    if !dsh_bin.exists() {
         return Err(
             "dsh runtime missing: run `npm install` in vendor/dsh-runtime (see vendor/dsh-runtime/package.json)"
                 .into(),
         );
     }
+    Ok(DshRuntime { node: "node".into(), dsh_bin, dsh_cwd: repo_root, home })
+}
+
+/**
+ * Spawn the dsh web server and return its tokenized URL.
+ * Runtime source: the installer-bundled zip (packaged) when present, else
+ * the repo checkout (dev). The URL line ("dsh web: http://…?token=…") is
+ * parsed from stdout; newer dsh may append " (LAN: http://…)" to the line,
+ * so only the first token is taken as the URL.
+ */
+fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
+    let port = free_port();
+    let rt = match packaged_runtime(app) {
+        Some(rt) => rt?,
+        None => dev_runtime()?,
+    };
 
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new("node");
-    cmd.arg(DSH_BIN)
+    let mut cmd = Command::new(&rt.node);
+    cmd.arg(&rt.dsh_bin)
         .arg("--profile")
         .arg("slacker")
         .arg("--host")
@@ -182,25 +350,37 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
         .arg("--port")
         .arg(port.to_string())
         .arg("--no-open")
-        .current_dir(&repo_root)
-        .env("DSH_HOME", &home)
+        .current_dir(&rt.dsh_cwd)
+        .env("DSH_HOME", &rt.home)
         .stdout(Stdio::piped());
+    // Bundled node: prepend its dir to the child PATH so anything the dsh
+    // runtime shells out to (`node`, file-archivers, …) resolves the pinned
+    // binary rather than whatever happens to be installed on the machine.
+    if rt.node.is_absolute() {
+        if let Some(node_dir) = rt.node.parent() {
+            let path_env = std::env::var_os("PATH").unwrap_or_default();
+            let prepended = std::env::join_paths(
+                std::iter::once(node_dir.to_path_buf()).chain(std::env::split_paths(&path_env)),
+            );
+            if let Ok(pre) = prepended {
+                cmd.env("PATH", pre);
+            }
+        }
+    }
     // Keep stderr on disk: when dsh fails to boot (e.g. bundle resolution),
     // the port wait times out with no clue — this log holds the real error.
     let stderr_log = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(home.join("dsh-web-stderr.log"))
+        .open(rt.home.join("dsh-web-stderr.log"))
         .map_err(|e| format!("open dsh stderr log: {e}"))?;
     cmd.stderr(Stdio::from(stderr_log));
     // No stray console window for the node child (release, GUI subsystem).
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn node: {e} (is Node.js on PATH?)"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn dsh node: {e}"))?;
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let url_arc = std::sync::Arc::new(Mutex::new(None::<String>));
@@ -227,7 +407,7 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
         let _ = child.kill();
         return Err(format!(
             "dsh web did not listen on port {port} within 60s; real error: {}",
-            home.join("dsh-web-stderr.log").display()
+            rt.home.join("dsh-web-stderr.log").display()
         ));
     }
     let deadline = Instant::now() + Duration::from_secs(10);

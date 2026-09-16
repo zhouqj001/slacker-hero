@@ -6,9 +6,12 @@
   "scripts": {
     "shell": "cd shell && npx tauri dev",
     "tauri": "cd shell && npx tauri",
+    "pack:runtime": "node shell/scripts/pack-runtime.cjs",
     "setup": "pnpm install && cd shell/plugins/ui-slacker && pnpm install && pnpm run bundle && cd ../novel && pnpm install && pnpm run bundle && cd ../../.. && node shell/scripts/standalone-assets.cjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.3"
+    "@tauri-apps/cli": "^2.11.3",
+    "archiver": "^7.0.1",
+    "extract-zip": "^2.0.1"
   }
 }

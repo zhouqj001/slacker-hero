@@ -8,6 +8,12 @@ edition = "2021"
 name = "slacker_shell_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# .transparent(true) on macOS compiles only with tauri's macos-private-api;
+# the flag is inert on Windows/Linux, so default-on keeps one feature set.
+default = ["macos-private-api"]
+macos-private-api = ["tauri/macos-private-api"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -33,9 +39,13 @@ regex = "1"
 # breaks under this feature set); 1.0.102 is the proven version from the main app.
 anyhow = "=1.0.102"
 # Native folder-picker for the novel download directory setting.
-rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+# gtk3 is required on Linux: rfd 0.15+ refuses to build without an explicit
+# backend ("gtk3" or "xdg-portal"); it is inert on Windows/macOS.
+rfd = { version = "0.15", features = ["common-controls-v6", "gtk3"] }
 # Zhihu x-zse-96 request signature: md5(sign source) feeds the block cipher.
 md5 = "0.7"
+# First-boot extraction of the bundled dsh runtime zip (resources/runtime/).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.dev]
 # rustc 1.97.1 (x86_64-pc-windows-gnu) 在增量编译下会随机触发
