@@ -72,51 +72,71 @@ struct DshRuntime {
     home: std::path::PathBuf,
 }
 
-/** Recursive directory copy (packaged profile sync). */
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
-    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let to = dst.join(entry.file_name());
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            copy_dir_recursive(&entry.path(), &to)?;
-        } else {
-            std::fs::copy(entry.path(), &to)
-                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
-
-/** Extract the bundled runtime zip into <local_data>/dsh/runtime. Idempotent:
- * the .version marker short-circuits; a version bump wipes and re-extracts
- * (dsh state lives in the sibling home/ and survives the upgrade). */
+/** Extract the bundled runtime zip in one pass. Entries under profiles/ go
+ * straight to <base>/home/profiles (the persistent dsh state, survives
+ * upgrades); everything else goes to <base>/runtime (wiped on upgrade).
+ * Each side carries a .version marker keyed by the zip fingerprint: matching
+ * markers skip extraction entirely, a changed zip re-extracts only the stale
+ * side. (Previously the profile was extracted into runtime/ and then copied
+ * to home/ — a second ~15k-file write that cost minutes under Defender.) */
 fn extract_packaged_runtime(
-    app: &tauri::AppHandle,
     zip_path: &std::path::Path,
-    runtime_dir: &std::path::Path,
+    base: &std::path::Path,
+    fingerprint: &str,
+    app: &tauri::AppHandle,
 ) -> Result<(), String> {
-    let version = app.package_info().version.to_string();
-    let marker = runtime_dir.join(".version");
-    if std::fs::read_to_string(&marker)
-        .map(|v| v == version)
-        .unwrap_or(false)
-    {
+    let runtime_dir = base.join("runtime");
+    let profile_root = base.join("home").join("profiles");
+    let runtime_marker = runtime_dir.join(".version");
+    let profile_marker = profile_root.join(".profile-version");
+    let marker_ok = |p: &std::path::Path| {
+        std::fs::read_to_string(p).map(|v| v == fingerprint).unwrap_or(false)
+    };
+    let runtime_fresh = marker_ok(&runtime_marker);
+    let profile_fresh = marker_ok(&profile_marker)
+        && profile_root.join("slacker").join("node_modules").exists();
+    if runtime_fresh && profile_fresh {
         return Ok(());
     }
-    if runtime_dir.exists() {
-        std::fs::remove_dir_all(runtime_dir).map_err(|e| format!("clean old runtime: {e}"))?;
+    // Markers are only written after a full pass, so anything on disk now is
+    // a leftover from an interrupted run — clear the stale sides up front.
+    if !runtime_fresh && runtime_dir.exists() {
+        std::fs::remove_dir_all(&runtime_dir).map_err(|e| format!("clean old runtime: {e}"))?;
     }
-    std::fs::create_dir_all(runtime_dir).map_err(|e| format!("create runtime dir: {e}"))?;
+    if !profile_fresh {
+        let slacker = profile_root.join("slacker");
+        if slacker.exists() {
+            std::fs::remove_dir_all(&slacker).map_err(|e| format!("clean old profile: {e}"))?;
+        }
+    }
+    std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("create runtime dir: {e}"))?;
     let file = std::fs::File::open(zip_path).map_err(|e| format!("open runtime zip: {e}"))?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|e| format!("read runtime zip: {e}"))?;
+    let total = archive.len();
+    // First-launch prep is pure I/O on tens of thousands of small files
+    // (minutes under AV scanning): report progress so it doesn't read as a
+    // hang. Throttled; payload { done, total }.
+    let mut last_emit = Instant::now();
     for i in 0..archive.len() {
+        if last_emit.elapsed() >= Duration::from_millis(250) {
+            last_emit = Instant::now();
+            let _ = app.emit(
+                "slacker:boot-progress",
+                serde_json::json!({ "done": i, "total": total }),
+            );
+        }
         let mut entry = archive.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
         let Some(rel) = entry.enclosed_name() else {
             continue;
         };
-        let out = runtime_dir.join(&rel);
+        // profiles/ holds the persistent dsh state; the rest (node dist +
+        // dsh runtime) is disposable and gets wiped on upgrades.
+        let (root, rel) = match rel.strip_prefix("profiles").ok() {
+            Some(rest) => (profile_root.clone(), rest.to_path_buf()),
+            None => (runtime_dir.clone(), rel),
+        };
+        let out = root.join(&rel);
         if entry.is_dir() {
             std::fs::create_dir_all(&out).map_err(|e| format!("zip mkdir {}: {e}", rel.display()))?;
             continue;
@@ -135,7 +155,19 @@ fn extract_packaged_runtime(
             let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
         }
     }
-    std::fs::write(&marker, &version).map_err(|e| format!("write runtime marker: {e}"))?;
+    let _ = app.emit(
+        "slacker:boot-progress",
+        serde_json::json!({ "done": total, "total": total }),
+    );
+    if !runtime_fresh {
+        std::fs::write(&runtime_marker, fingerprint)
+            .map_err(|e| format!("write runtime marker: {e}"))?;
+    }
+    if !profile_fresh {
+        std::fs::create_dir_all(&profile_root).map_err(|e| format!("create profiles dir: {e}"))?;
+        std::fs::write(&profile_marker, fingerprint)
+            .map_err(|e| format!("write profile marker: {e}"))?;
+    }
     Ok(())
 }
 
@@ -163,29 +195,24 @@ fn packaged_runtime(app: &tauri::AppHandle) -> Option<Result<DshRuntime, String>
             .map_err(|e| format!("app local data dir: {e}"))?
             .join("dsh");
         let runtime_dir = base.join("runtime");
-        extract_packaged_runtime(app, &zip_path, &runtime_dir)?;
+        // Fingerprint the bundled zip (size + entry count), not the app
+        // version: re-issued installers within the same version (rebuilt
+        // release tag, newer bundled node) must still wipe the stale runtime.
+        let zip_len = std::fs::metadata(&zip_path)
+            .map_err(|e| format!("stat runtime zip: {e}"))?
+            .len();
+        let entries = zip::ZipArchive::new(std::io::BufReader::new(
+            std::fs::File::open(&zip_path).map_err(|e| format!("open runtime zip: {e}"))?,
+        ))
+        .map_err(|e| format!("read runtime zip: {e}"))?
+        .len();
+        let fingerprint = format!("{zip_len}:{entries}");
+        extract_packaged_runtime(&zip_path, &base, &fingerprint, app)?;
 
-        // DSH_HOME persists across upgrades; only the slacker profile layer
-        // re-syncs from the extracted pristine copy when the version moves.
+        // DSH_HOME persists across upgrades. The extract already routed
+        // profiles/ straight into home/profiles (single pass); runtime/ is
+        // the disposable node + dsh layer wiped on upgrade.
         let home = base.join("home");
-        let profile_dst = home.join("profiles").join("slacker");
-        let profile_marker = home.join("profiles").join(".profile-version");
-        let version = app.package_info().version.to_string();
-        let fresh = profile_dst.join("node_modules").exists()
-            && std::fs::read_to_string(&profile_marker)
-                .map(|v| v == version)
-                .unwrap_or(false);
-        if !fresh {
-            if profile_dst.exists() {
-                std::fs::remove_dir_all(&profile_dst)
-                    .map_err(|e| format!("clean old profile: {e}"))?;
-            }
-            copy_dir_recursive(&runtime_dir.join("profiles").join("slacker"), &profile_dst)?;
-            std::fs::create_dir_all(home.join("profiles"))
-                .map_err(|e| format!("create profiles dir: {e}"))?;
-            std::fs::write(&profile_marker, &version)
-                .map_err(|e| format!("write profile marker: {e}"))?;
-        }
 
         // Bundled node: Windows always ships x64 (runs under ARM emulation,
         // dodging cross-arch npm optional deps); the mac zip carries both.
@@ -416,6 +443,7 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
             *app.state::<ShellState>().url.lock().unwrap() = u.clone();
             *app.state::<ShellState>().child.lock().unwrap() = Some(child);
             println!("[slacker] boot url stored (len={})", u.len());
+            selftest_browser_auth(&u, &rt.home);
             return Ok(u);
         }
         if Instant::now() > deadline {
@@ -426,12 +454,117 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     }
 }
 
+/** One raw HTTP/1.1 exchange over a fresh TcpStream (Connection: close);
+ * returns the full response text, capped at 1 MiB. */
+fn http_exchange(host: &str, port: u16, request: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    stream.take(1 << 20).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/** First response line + any set-cookie header, for the self-test log. */
+fn summarize_response(resp: &str) -> String {
+    let status = resp.lines().next().unwrap_or("(empty response)").to_string();
+    let cookie = resp
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| "(no set-cookie)".into());
+    let body: String = resp
+        .split("\r\n\r\n")
+        .nth(1)
+        .map(|b| b.chars().take(160).collect())
+        .unwrap_or_default();
+    format!("{status}\n  {cookie}\n  body: {body:?}")
+}
+
+/**
+ * After boot, replay the browser auth handshake over raw HTTP and log the
+ * exchange to <home>/dsh-web-selftest.log. GET /?token=… must answer 303
+ * with a set-cookie, and that cookie must then authenticate GET / — this
+ * splits reported "dsh web authentication required" 401s into server-side
+ * failures (this log shows 401s too) versus WebView-side cookie/navigation
+ * failures (this log shows 303/200 while the window still shows the 401).
+ */
+fn selftest_browser_auth(url: &str, home: &std::path::Path) {
+    let rest = match url.strip_prefix("http://") {
+        Some(rest) => rest,
+        None => {
+            let _ = std::fs::write(
+                home.join("dsh-web-selftest.log"),
+                format!("selftest: unexpected url scheme: {url}\n"),
+            );
+            return;
+        }
+    };
+    let (authority, path_query) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    let request = |extra: &str| {
+        format!(
+            "GET {path_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n{extra}\r\n"
+        )
+    };
+    let mut log = format!("selftest @ {url}\n");
+
+    let first = authority
+        .split_once(':')
+        .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(80)))
+        .unwrap_or((authority.to_string(), 80));
+    match http_exchange(&first.0, first.1, &request("")) {
+        Some(resp) => {
+            log.push_str("step1 token URL:\n  ");
+            log.push_str(&summarize_response(&resp).replace('\n', "\n  "));
+            log.push('\n');
+            // Relay the minted cookie into step 2 exactly as a browser would.
+            let cookie = resp
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|pair| pair.trim().split(';').next().unwrap_or("").trim().to_string());
+            match cookie {
+                Some(cookie) if !cookie.is_empty() => {
+                    let second = http_exchange(&first.0, first.1, &request(&format!("Cookie: {cookie}\r\n")));
+                    match second {
+                        Some(resp) => {
+                            log.push_str("step2 cookie GET /:\n  ");
+                            log.push_str(&summarize_response(&resp).replace('\n', "\n  "));
+                            log.push('\n');
+                        }
+                        None => log.push_str("step2 cookie GET /: connection failed\n"),
+                    }
+                }
+                _ => log.push_str("step2 skipped: step1 minted no cookie\n"),
+            }
+        }
+        None => log.push_str("step1 token URL: connection failed\n"),
+    }
+    let _ = std::fs::write(home.join("dsh-web-selftest.log"), log);
+}
+
 /**
  * Boot (or reboot) the dsh runtime and return its URL.
  * @returns the tokenized web URL and whether an existing child was replaced.
  */
 #[tauri::command]
-fn shell_boot(app: tauri::AppHandle, state: State<ShellState>) -> Result<BootInfo, String> {
+async fn shell_boot(app: tauri::AppHandle) -> Result<BootInfo, String> {
+    // NOTE(Windows): sync commands run on the main thread — spawn_dsh_web
+    // parks up to 60s waiting for the dsh port, which froze the whole window
+    // ("not responding"). Run the blocking boot on the async runtime's
+    // blocking pool; the command resolves without touching the main thread.
+    tauri::async_runtime::spawn_blocking(move || shell_boot_blocking(&app))
+        .await
+        .map_err(|e| format!("boot task failed: {e}"))?
+}
+
+fn shell_boot_blocking(app: &tauri::AppHandle) -> Result<BootInfo, String> {
+    let state = app.state::<ShellState>();
     let restarted = state.child.lock().unwrap().is_some();
     if restarted {
         if let Some(mut c) = state.child.lock().unwrap().take() {
@@ -445,7 +578,21 @@ fn shell_boot(app: tauri::AppHandle, state: State<ShellState>) -> Result<BootInf
             }
         }
     }
-    let url = spawn_dsh_web(&app)?;
+    let url = spawn_dsh_web(app)?;
+    // Navigate from the Rust side. wry's navigate() maps to WebView2's
+    // Navigate() — a browser-initiated navigation, like typing in the address
+    // bar. The splash page used to call window.location.replace(info.url),
+    // which makes tauri.localhost the cross-site initiator of the navigation
+    // chain; with dsh's SameSite=Strict auth cookie, the 303 redirect-follow
+    // request then drops the cookie and dsh answers 401. Confirmed with a
+    // Chrome lab: JS-initiated cross-site navigation -> GET / after the 303
+    // arrives cookie-less, browser-initiated navigation -> cookie present.
+    if let Ok(parsed) = tauri::Url::parse(&url) {
+        if let Some(win) = app.get_webview_window("main") {
+            win.navigate(parsed)
+                .map_err(|e| format!("navigate to {url} failed: {e}"))?;
+        }
+    }
     Ok(BootInfo { url, restarted })
 }
 

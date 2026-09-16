@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "installer": "tauri build --target x86_64-pc-windows-gnu"
   }
 }

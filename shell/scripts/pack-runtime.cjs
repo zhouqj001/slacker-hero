@@ -34,7 +34,10 @@ const https = require('node:https');
 const archiver = require('archiver');
 const extractZip = require('extract-zip');
 
-const NODE_VERSION = process.env.RUNTIME_NODE_VERSION || '22.14.0';
+// >= 22.18.0 required: dsh's bin.js gates on `import.meta.main`, which Node
+// only added in v22.18.0/v24.2.0 — older nodes exit silently (exit 0, no
+// output, no listener) and the shell reports a 60s boot timeout.
+const NODE_VERSION = process.env.RUNTIME_NODE_VERSION || '22.23.2';
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const shellDir = path.resolve(__dirname, '..');

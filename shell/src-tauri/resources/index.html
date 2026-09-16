@@ -43,14 +43,25 @@
   <script>
     const { invoke } = window.__TAURI__.core
 
+    // First launch unpacks ~46k files (minutes under AV scanning): surface
+    // the extraction progress so it doesn't read as a hang.
+    window.__TAURI__.event.listen('slacker:boot-progress', (e) => {
+      const { done, total } = e.payload || {}
+      document.getElementById('status').textContent = done >= total
+        ? '运行时解压完成，正在启动…'
+        : `正在解压运行时 ${done}/${total}…`
+    })
+
     async function boot () {
       document.getElementById('status').textContent = '正在启动 Agent 运行时…'
       document.getElementById('error').style.display = 'none'
       document.getElementById('retry').style.display = 'none'
       try {
-        const info = await invoke('shell_boot')
+        await invoke('shell_boot')
+        // shell_boot navigates the window from the Rust side (browser-initiated,
+        // required for dsh's SameSite=Strict auth cookie to survive the 303);
+        // a JS location.replace() here would leak the cookie cross-site.
         document.getElementById('status').textContent = '运行时就绪，正在进入工作台…'
-        window.location.replace(info.url)
       } catch (err) {
         document.getElementById('status').textContent = '启动失败'
         const el = document.getElementById('error')

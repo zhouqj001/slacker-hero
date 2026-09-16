@@ -25,6 +25,9 @@ shell/src-tauri/resources/runtime/
 data/
 temp/
 *.tmp
+.repro/
+.tauri-tools-cache/
+tmp-dsh-home/
 
 # ---- 本地运行时状态 (dsh home: token/workbench SQLite/stderr 日志等) ----
 .dsh-dev/

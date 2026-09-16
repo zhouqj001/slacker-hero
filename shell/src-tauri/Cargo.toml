@@ -18,7 +18,12 @@ macos-private-api = ["tauri/macos-private-api"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# macos-private-api must be listed directly here (not only via our passthrough
+# feature): tauri-build validates this array against tauri.conf.json's
+# macOSPrivateApi flag on every bare `cargo check/build`.
+# NOTE: deliberately NO `devtools` — release builds must NOT open the
+# inspector (F12); tauri only ships it in debug builds by default.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,8 +45,9 @@ regex = "1"
 anyhow = "=1.0.102"
 # Native folder-picker for the novel download directory setting.
 # gtk3 is required on Linux: rfd 0.15+ refuses to build without an explicit
-# backend ("gtk3" or "xdg-portal"); it is inert on Windows/macOS.
-rfd = { version = "0.15", features = ["common-controls-v6", "gtk3"] }
+# backend. default-features must stay off — the default enables xdg-portal,
+# and rfd panics when gtk3 and xdg-portal are both enabled.
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6", "gtk3"] }
 # Zhihu x-zse-96 request signature: md5(sign source) feeds the block cipher.
 md5 = "0.7"
 # First-boot extraction of the bundled dsh runtime zip (resources/runtime/).
