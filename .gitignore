@@ -32,6 +32,9 @@ tmp-dsh-home/
 # ---- 本地运行时状态 (dsh home: token/workbench SQLite/stderr 日志等) ----
 .dsh-dev/
 
+# ---- dsh 运行时托管目录 (dsh 启动时自动物化, 严禁入库/打进运行时包) ----
+shell/dsh-profile/slacker/.dsh-module-fallback/
+
 # ---- 第三方 monorepo 快照 (方案A后零引用, 仅本地参考, 不入库) ----
 vendor/deepseek-harness/
 

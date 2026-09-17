@@ -118,6 +118,31 @@ async function extractArchive (archivePath, kind) {
   return into;
 }
 
+/** Zip `root` under `prefix`, skipping dsh-managed runtime state. The profile
+ * template must ship as a plain file tree: `.dsh-module-fallback` is
+ * materialized/owned by dsh at boot (healProfileModuleFallback) and any real
+ * directory found there makes dsh abort with "exists and is not a symlink" —
+ * shipping a template copy of it bricks first boot (v0.0.1 regression).
+ * archiver's a.directory() has no exclude, hence the manual walk. */
+const PROFILE_ZIP_SKIP = new Set(['.dsh-module-fallback']);
+
+function addTree (a, root, prefix) {
+  for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
+    if (PROFILE_ZIP_SKIP.has(ent.name)) continue;
+    const src = path.join(root, ent.name);
+    const inZip = `${prefix}/${ent.name}`;
+    if (ent.isDirectory()) {
+      addTree(a, src, inZip);
+      if (fs.readdirSync(src).length === 0) a.directory(src, inZip); // keep empty dirs
+    } else if (ent.isFile() || ent.isSymbolicLink()) {
+      // data must be an object: archiver's string-name shorthand never gets
+      // normalized to { name } for file(), and zip-stream then rejects the
+      // entry ("entry name must be a non-empty string value").
+      a.file(src, { name: inZip });
+    }
+  }
+}
+
 async function main () {
   const target = parseTarget();
   log(`target=${target} node=v${NODE_VERSION}`);
@@ -176,7 +201,7 @@ async function main () {
     a.pipe(output);
     for (const [dir, extracted] of nodeDirs) a.directory(extracted, `node/${dir}`);
     a.directory(path.join(runtimeDir, 'node_modules'), 'dsh/node_modules');
-    a.directory(profileDir, 'profiles/slacker');
+    addTree(a, profileDir, 'profiles/slacker');
     a.finalize();
   });
   const mb = (fs.statSync(outZip).size / 1048576).toFixed(1);

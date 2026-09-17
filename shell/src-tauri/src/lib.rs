@@ -100,14 +100,23 @@ fn extract_packaged_runtime(
     }
     // Markers are only written after a full pass, so anything on disk now is
     // a leftover from an interrupted run — clear the stale sides up front.
-    if !runtime_fresh && runtime_dir.exists() {
+    // The wipe is minutes of I/O itself (tens of thousands of stale files
+    // under AV scanning): surface it, or the splash sits silent on "starting"
+    // before the extraction progress ever begins.
+    let stale_runtime = !runtime_fresh && runtime_dir.exists();
+    let stale_profile = !profile_fresh && profile_root.join("slacker").exists();
+    if stale_runtime || stale_profile {
+        let _ = app.emit(
+            "slacker:boot-progress",
+            serde_json::json!({ "phase": "cleanup" }),
+        );
+    }
+    if stale_runtime {
         std::fs::remove_dir_all(&runtime_dir).map_err(|e| format!("clean old runtime: {e}"))?;
     }
-    if !profile_fresh {
-        let slacker = profile_root.join("slacker");
-        if slacker.exists() {
-            std::fs::remove_dir_all(&slacker).map_err(|e| format!("clean old profile: {e}"))?;
-        }
+    if stale_profile {
+        std::fs::remove_dir_all(profile_root.join("slacker"))
+            .map_err(|e| format!("clean old profile: {e}"))?;
     }
     std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("create runtime dir: {e}"))?;
     let file = std::fs::File::open(zip_path).map_err(|e| format!("open runtime zip: {e}"))?;
