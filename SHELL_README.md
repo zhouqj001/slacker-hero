@@ -1,4 +1,4 @@
-# Slacker Shell — Tauri 桌面壳
+# Slacker Hero — Tauri 桌面壳
 
 **`npm run shell`** 启动的独立 Tauri 应用。原生支持：茶水间、小说阅读器、游戏、股票行情/悬浮窗，并提供通用的本地存储、全局快捷键、HTTP 代理等能力。
 
@@ -34,7 +34,7 @@ npm run shell
 
 # 3. 生产构建
 cd shell && cargo build --release
-# 产物：shell/src-tauri/target/release/slacker-shell.exe
+# 产物：shell/src-tauri/target/release/slacker-hero.exe
 ```
 
 ### 常用命令
@@ -52,7 +52,7 @@ cd shell && cargo build --release
 ## 目录结构
 
 ```
-slacker-shell/
+slacker-hero/
 ├── package.json              # 根脚本：setup / shell
 ├── shell/                    # Tauri 应用核心
 │   ├── src-tauri/            # Rust 后端

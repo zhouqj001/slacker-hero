@@ -16,7 +16,7 @@
     "core:event:default",
     "core:event:allow-emit",
     "core:app:default",
-    "allow-slacker-shell",
+    "allow-slacker-hero",
     "allow-slacker-kv",
     "allow-slacker-novel",
     "allow-slacker-stock",

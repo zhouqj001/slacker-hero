@@ -74,7 +74,7 @@ jobs:
           tauriScript: npx tauri
           args: --target ${{ matrix.target }} ${{ matrix.extra }}
           tagName: ${{ github.ref_name }}
-          releaseName: 'Slacker Shell ${{ github.ref_name }}'
-          releaseBody: '跨平台安装包：Windows x64 / ARM64 · macOS（Apple Silicon + Intel 通用）· Linux（AppImage + deb）。安装包均未签名：Windows 首次运行如遇 SmartScreen 请选择「仍要运行」；macOS 请右键打开或执行 `xattr -cr /Applications/slacker-shell.app`。'
+          releaseName: 'Slacker Hero ${{ github.ref_name }}'
+          releaseBody: '跨平台安装包：Windows x64 / ARM64 · macOS（Apple Silicon + Intel 通用）· Linux（AppImage + deb）。安装包均未签名：Windows 首次运行如遇 SmartScreen 请选择「仍要运行」；macOS 请右键打开或执行 `xattr -cr /Applications/slacker-hero.app`。'
           releaseDraft: false
           prerelease: false

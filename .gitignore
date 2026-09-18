@@ -1,57 +1,31 @@
-# ---- Node / pnpm ----
+# ---- 依赖 / 构建产物 (全部自动生成, 勿入库) ----
 node_modules/
 .pnpm-store/
-.pnpm-cache/
-.npm-cache/
 *.tsbuildinfo
 *.log
-npm-debug.log*
-pnpm-debug.log*
-
-# ---- tsdown 构建产物 (插件 lib/,源码在 src/,pnpm run bundle 重建) ----
 shell/plugins/*/lib/
-
-# ---- Tauri 后端构建产物 ----
 shell/src-tauri/target/
 shell/src-tauri/gen/
-
-# ---- Tauri 运行时前端资源 (standalone-assets.cjs 从 resources + 插件 lib 生成) ----
 shell/ui/
-
-# ---- 安装包内置运行时 zip (pack-runtime.cjs 生成, 入 tauri resources) ----
 shell/src-tauri/resources/runtime/
 
-# ---- 运行数据 / 临时文件 ----
+# ---- 运行数据 / 本地状态 (严禁入库) ----
 data/
 temp/
-*.tmp
+logs/
 .repro/
-.tauri-tools-cache/
-tmp-dsh-home/
-
-# ---- 本地运行时状态 (dsh home: token/workbench SQLite/stderr 日志等) ----
 .dsh-dev/
-
-# ---- dsh 运行时托管目录 (dsh 启动时自动物化, 严禁入库/打进运行时包) ----
+tmp-dsh-home/
 shell/dsh-profile/slacker/.dsh-module-fallback/
-
-# ---- 第三方 monorepo 快照 (方案A后零引用, 仅本地参考, 不入库) ----
 vendor/deepseek-harness/
 
-# ---- 环境变量 ----
+# ---- 环境变量 / IDE ----
 .env
 .env.*
 !.env.example
-
-# ---- IDE ----
 .vscode/
 .idea/
-*.swp
 .DS_Store
-
-logs/
-logs/*
-
-# ==== 注意 ====
-# shell/src-tauri/Cargo.lock 有意提交(可复现构建/快速增量)
-# shell/plugins/*/pnpm-lock.yaml 有意提交(锁定 tsdown/react 等版本)
+docs/
+.tauri-tools-cache/
+# 有意提交: shell/src-tauri/Cargo.lock 与 shell/plugins/*/pnpm-lock.yaml

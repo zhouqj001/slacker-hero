@@ -1,4 +1,4 @@
-# Slacker Shell — dsh 桌面 Agent 工作台 + 摸鱼五件套
+# Slacker Hero — dsh 桌面 Agent 工作台 + 摸鱼五件套
 
 以 [dsh (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness) 为 Agent 运行基座的 Tauri 2 桌面壳,一个半透明小窗装下 **AI Agent 工作台** 与摸鱼日常:**茶水间 + 股票行情 + 小说阅读器 + 知乎摸鱼 + 贪吃蛇/2048**。
 
@@ -93,7 +93,7 @@ cd shell && cargo build --release   # 生产构建
 ## 目录结构
 
 ```
-slacker-shell/
+slacker-hero/
 ├── package.json              # 根脚本: setup / shell
 ├── SHELL_README.md           # 完整开发文档
 ├── legado-book-sources.json  # 小说默认书源数据 (Legado 格式,阅读器「书源」页导入即用)

@@ -1,11 +1,11 @@
 [package]
-name = "slacker-shell"
+name = "slacker-hero"
 version = "0.0.1"
 description = "Minimal Tauri shell hosting the dsh web runtime"
 edition = "2021"
 
 [lib]
-name = "slacker_shell_lib"
+name = "slacker_hero_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
@@ -50,8 +50,6 @@ anyhow = "=1.0.102"
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6", "gtk3"] }
 # Zhihu x-zse-96 request signature: md5(sign source) feeds the block cipher.
 md5 = "0.7"
-# First-boot extraction of the bundled dsh runtime zip (resources/runtime/).
-zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.dev]
 # rustc 1.97.1 (x86_64-pc-windows-gnu) 在增量编译下会随机触发

@@ -72,178 +72,177 @@ struct DshRuntime {
     home: std::path::PathBuf,
 }
 
-/** Extract the bundled runtime zip in one pass. Entries under profiles/ go
- * straight to <base>/home/profiles (the persistent dsh state, survives
- * upgrades); everything else goes to <base>/runtime (wiped on upgrade).
- * Each side carries a .version marker keyed by the zip fingerprint: matching
- * markers skip extraction entirely, a changed zip re-extracts only the stale
- * side. (Previously the profile was extracted into runtime/ and then copied
- * to home/ — a second ~15k-file write that cost minutes under Defender.) */
-fn extract_packaged_runtime(
-    zip_path: &std::path::Path,
-    base: &std::path::Path,
-    fingerprint: &str,
-    app: &tauri::AppHandle,
+/** Copy `src` into `dst` recursively (dirs created; symlinks dereferenced by
+ * fs::copy). `done` counts copied files; `progress` is invoked after each
+ * file so the splash can show movement. Returns (files, bytes). */
+fn copy_tree(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    progress: &mut dyn FnMut(),
+) -> Result<(u64, u64), String> {
+    let mut state = (0u64, 0u64);
+    copy_tree_inner(src, dst, &mut state, progress)?;
+    Ok(state)
+}
+
+fn copy_tree_inner(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    state: &mut (u64, u64),
+    progress: &mut dyn FnMut(),
 ) -> Result<(), String> {
-    let runtime_dir = base.join("runtime");
-    let profile_root = base.join("home").join("profiles");
-    let runtime_marker = runtime_dir.join(".version");
-    let profile_marker = profile_root.join(".profile-version");
-    let marker_ok = |p: &std::path::Path| {
-        std::fs::read_to_string(p).map(|v| v == fingerprint).unwrap_or(false)
-    };
-    let runtime_fresh = marker_ok(&runtime_marker);
-    let profile_fresh = marker_ok(&profile_marker)
-        && profile_root.join("slacker").join("node_modules").exists();
-    if runtime_fresh && profile_fresh {
-        return Ok(());
-    }
-    // Markers are only written after a full pass, so anything on disk now is
-    // a leftover from an interrupted run — clear the stale sides up front.
-    // The wipe is minutes of I/O itself (tens of thousands of stale files
-    // under AV scanning): surface it, or the splash sits silent on "starting"
-    // before the extraction progress ever begins.
-    let stale_runtime = !runtime_fresh && runtime_dir.exists();
-    let stale_profile = !profile_fresh && profile_root.join("slacker").exists();
-    if stale_runtime || stale_profile {
-        let _ = app.emit(
-            "slacker:boot-progress",
-            serde_json::json!({ "phase": "cleanup" }),
-        );
-    }
-    if stale_runtime {
-        std::fs::remove_dir_all(&runtime_dir).map_err(|e| format!("clean old runtime: {e}"))?;
-    }
-    if stale_profile {
-        std::fs::remove_dir_all(profile_root.join("slacker"))
-            .map_err(|e| format!("clean old profile: {e}"))?;
-    }
-    std::fs::create_dir_all(&runtime_dir).map_err(|e| format!("create runtime dir: {e}"))?;
-    let file = std::fs::File::open(zip_path).map_err(|e| format!("open runtime zip: {e}"))?;
-    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|e| format!("read runtime zip: {e}"))?;
-    let total = archive.len();
-    // First-launch prep is pure I/O on tens of thousands of small files
-    // (minutes under AV scanning): report progress so it doesn't read as a
-    // hang. Throttled; payload { done, total }.
-    let mut last_emit = Instant::now();
-    for i in 0..archive.len() {
-        if last_emit.elapsed() >= Duration::from_millis(250) {
-            last_emit = Instant::now();
-            let _ = app.emit(
-                "slacker:boot-progress",
-                serde_json::json!({ "done": i, "total": total }),
-            );
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type().map_err(|e| format!("stat {}: {e}", from.display()))?;
+        if ft.is_dir() {
+            std::fs::create_dir_all(&to).map_err(|e| format!("mkdir {}: {e}", to.display()))?;
+            copy_tree_inner(&from, &to, state, progress)?;
+        } else {
+            let meta =
+                std::fs::metadata(&from).map_err(|e| format!("stat {}: {e}", from.display()))?;
+            std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?;
+            state.0 += 1;
+            state.1 += meta.len();
+            progress();
         }
-        let mut entry = archive.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
-        let Some(rel) = entry.enclosed_name() else {
-            continue;
-        };
-        // profiles/ holds the persistent dsh state; the rest (node dist +
-        // dsh runtime) is disposable and gets wiped on upgrades.
-        let (root, rel) = match rel.strip_prefix("profiles").ok() {
-            Some(rest) => (profile_root.clone(), rest.to_path_buf()),
-            None => (runtime_dir.clone(), rel),
-        };
-        let out = root.join(&rel);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out).map_err(|e| format!("zip mkdir {}: {e}", rel.display()))?;
-            continue;
-        }
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("zip mkdir {}: {e}", rel.display()))?;
-        }
-        let mut out_file = std::fs::File::create(&out)
-            .map_err(|e| format!("zip create {}: {e}", rel.display()))?;
-        std::io::copy(&mut entry, &mut out_file)
-            .map_err(|e| format!("zip write {}: {e}", rel.display()))?;
-        #[cfg(unix)]
-        if let Some(mode) = entry.unix_mode() {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode));
-        }
-    }
-    let _ = app.emit(
-        "slacker:boot-progress",
-        serde_json::json!({ "done": total, "total": total }),
-    );
-    if !runtime_fresh {
-        std::fs::write(&runtime_marker, fingerprint)
-            .map_err(|e| format!("write runtime marker: {e}"))?;
-    }
-    if !profile_fresh {
-        std::fs::create_dir_all(&profile_root).map_err(|e| format!("create profiles dir: {e}"))?;
-        std::fs::write(&profile_marker, fingerprint)
-            .map_err(|e| format!("write profile marker: {e}"))?;
     }
     Ok(())
 }
 
-/** Runtime from the installer bundle (pack-runtime.cjs zip under resources):
- * embedded node + dsh runtime + pre-installed profile — zero machine deps
- * (no system node/pnpm, no junctions, no network). None when the zip is
- * absent, i.e. `tauri dev`, which keeps using the repo checkout. */
+/** Copy the bundled profile template (resources/runtime/profiles/slacker)
+ * into the persistent dsh home on first boot and after template changes.
+ * Only this tree is materialized: dsh writes into the profile (plugin
+ * installs, .dsh-module-fallback healing), while node + the dsh node_modules
+ * run straight from the install dir with zero first-boot unpacking.
+ * Freshness is keyed by the .pack-version stamp (template file/byte totals
+ * written by pack-runtime.cjs), mirroring the old zip fingerprint semantics:
+ * a matching marker skips the copy entirely, a changed installer re-copies
+ * only the profile. The copy is still thousands of small files (minutes
+ * under AV scanning) — report progress so it never reads as a hang. */
+fn materialize_profile(
+    stamp_path: &std::path::Path,
+    template: &std::path::Path,
+    profile_root: &std::path::Path,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    let profile_dst = profile_root.join("slacker");
+    let marker = profile_root.join(".profile-version");
+    let stamp = std::fs::read_to_string(stamp_path).unwrap_or_default();
+    let total: u64 = stamp
+        .split(':')
+        .next()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+    let fresh = std::fs::read_to_string(&marker).map(|v| v == stamp).unwrap_or(false)
+        && profile_dst.join("node_modules").exists();
+    if fresh {
+        return Ok(());
+    }
+    if profile_dst.exists() {
+        // Leftover from a previous installer: wipe before copying so files
+        // removed upstream cannot linger. Surface it — the wipe alone is
+        // seconds-to-minutes of I/O under AV scanning.
+        let _ = app.emit(
+            "slacker:boot-progress",
+            serde_json::json!({ "phase": "cleanup" }),
+        );
+        std::fs::remove_dir_all(&profile_dst).map_err(|e| format!("clean old profile: {e}"))?;
+    }
+    std::fs::create_dir_all(&profile_dst).map_err(|e| format!("create profile dir: {e}"))?;
+    let mut last_emit = Instant::now();
+    let mut progress = || {
+        if last_emit.elapsed() >= Duration::from_millis(250) {
+            last_emit = Instant::now();
+            let _ = app.emit(
+                "slacker:boot-progress",
+                serde_json::json!({ "done": 0, "total": total }),
+            );
+        }
+    };
+    // `done` inside the closure can't see copy_tree's counter; emit a
+    // coarse "working" tick (done:0) — the splash only needs motion, and
+    // the profile copy is bounded by the stamp total anyway.
+    let (files, _) = copy_tree(template, &profile_dst, &mut progress)
+        .map_err(|e| format!("materialize profile template: {e}"))?;
+    let _ = app.emit(
+        "slacker:boot-progress",
+        serde_json::json!({ "done": total.max(files), "total": total.max(files) }),
+    );
+    std::fs::write(&marker, stamp).map_err(|e| format!("write profile marker: {e}"))?;
+    Ok(())
+}
+
+/** Runtime from the installer bundle (pack-runtime.cjs loose tree under
+ * resources): embedded node + dsh runtime + pre-installed profile — zero
+ * machine deps (no system node/pnpm, no junctions, no network). Nothing is
+ * unpacked at boot: node and dsh run straight from the install dir (the
+ * NSIS default is a per-user install, writable at runtime — same shape as
+ * dsh-desktop); only the profile template is copied into the persistent
+ * home. None when the tree is absent, i.e. `tauri dev`, which keeps using
+ * the repo checkout. */
+/** Tauri's resource_dir() returns a verbatim path (\\?\D:\...). Node's
+ * entry-point resolver mangles verbatim argv entries (EISDIR lstat 'D:'),
+ * so strip the prefix back to a plain Win32 path before exec'ing node. */
+fn simplify_path(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        p
+    }
+}
+
 fn packaged_runtime(app: &tauri::AppHandle) -> Option<Result<DshRuntime, String>> {
-    let zip_path = app
-        .path()
-        .resource_dir()
-        .ok()?
-        // resources keep their src-tauri-relative layout in the bundle:
-        // resources/runtime/dsh-runtime.zip -> $RESOURCE/resources/runtime/...
-        .join("resources")
-        .join("runtime")
-        .join("dsh-runtime.zip");
-    if !zip_path.exists() {
+    let runtime_dir = simplify_path(
+        app.path()
+            .resource_dir()
+            .ok()?
+            // resources keep their src-tauri-relative layout in the bundle:
+            // resources/runtime/... -> $RESOURCE/resources/runtime/...
+            .join("resources")
+            .join("runtime"),
+    );
+    // Presence of the bundled node marks a packaged build.
+    // Bundled node: Windows always ships x64 (runs under ARM emulation,
+    // dodging cross-arch npm optional deps); the mac bundle carries both.
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let node_rel: String = match std::env::consts::OS {
+        "windows" => "node/win32-x64/node.exe".into(),
+        "macos" => format!("node/darwin-{arch}/bin/node"),
+        _ => format!("node/linux-{arch}/bin/node"),
+    };
+    let node = runtime_dir.join(node_rel);
+    if !node.exists() {
         return None;
     }
     Some((|| {
-        let base = app
-            .path()
-            .app_local_data_dir()
-            .map_err(|e| format!("app local data dir: {e}"))?
-            .join("dsh");
-        let runtime_dir = base.join("runtime");
-        // Fingerprint the bundled zip (size + entry count), not the app
-        // version: re-issued installers within the same version (rebuilt
-        // release tag, newer bundled node) must still wipe the stale runtime.
-        let zip_len = std::fs::metadata(&zip_path)
-            .map_err(|e| format!("stat runtime zip: {e}"))?
-            .len();
-        let entries = zip::ZipArchive::new(std::io::BufReader::new(
-            std::fs::File::open(&zip_path).map_err(|e| format!("open runtime zip: {e}"))?,
-        ))
-        .map_err(|e| format!("read runtime zip: {e}"))?
-        .len();
-        let fingerprint = format!("{zip_len}:{entries}");
-        extract_packaged_runtime(&zip_path, &base, &fingerprint, app)?;
-
-        // DSH_HOME persists across upgrades. The extract already routed
-        // profiles/ straight into home/profiles (single pass); runtime/ is
-        // the disposable node + dsh layer wiped on upgrade.
-        let home = base.join("home");
-
-        // Bundled node: Windows always ships x64 (runs under ARM emulation,
-        // dodging cross-arch npm optional deps); the mac zip carries both.
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "x64",
-            "aarch64" => "arm64",
-            other => other,
-        };
-        let node_rel: String = match std::env::consts::OS {
-            "windows" => "node/win32-x64/node.exe".into(),
-            "macos" => format!("node/darwin-{arch}/bin/node"),
-            _ => format!("node/linux-{arch}/bin/node"),
-        };
-        let node = runtime_dir.join(node_rel);
-        if !node.exists() {
-            return Err(format!("bundled node missing: {}", node.display()));
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755));
         }
+        // DSH_HOME persists across upgrades (app data); the node + dsh
+        // layers stay in the install dir and are replaced by the installer.
+        let home = app
+            .path()
+            .app_local_data_dir()
+            .map_err(|e| format!("app local data dir: {e}"))?
+            .join("dsh")
+            .join("home");
+        materialize_profile(
+            &runtime_dir.join("profiles").join(".pack-version"),
+            &runtime_dir.join("profiles").join("slacker"),
+            &home.join("profiles"),
+            app,
+        )?;
         let dsh_bin = runtime_dir
             .join("dsh")
             .join("node_modules")
@@ -251,12 +250,14 @@ fn packaged_runtime(app: &tauri::AppHandle) -> Option<Result<DshRuntime, String>
             .join("dsh")
             .join("lib")
             .join("bin.js");
-        if !dsh_bin.exists() {
+        if !dsh_bin.is_file() {
             return Err(format!("bundled dsh runtime missing: {}", dsh_bin.display()));
         }
         Ok(DshRuntime {
             node,
             dsh_bin,
+            // cwd inside the install dir (dsh-desktop parity): all dsh state
+            // routes to DSH_HOME, nothing is written to the cwd itself.
             dsh_cwd: runtime_dir.join("dsh"),
             home,
         })
@@ -350,7 +351,7 @@ fn dev_runtime() -> Result<DshRuntime, String> {
 
     // The runtime's node_modules is gitignored; a fresh clone without the
     // one-time `npm install` in vendor/dsh-runtime would otherwise fail with
-    // a cryptic MODULE_NOT_FOUND inside dsh's stderr log after a 60s timeout.
+    // a cryptic MODULE_NOT_FOUND inside dsh's stderr log after a boot timeout.
     let dsh_bin = repo_root.join(DSH_BIN);
     if !dsh_bin.exists() {
         return Err(
@@ -363,8 +364,8 @@ fn dev_runtime() -> Result<DshRuntime, String> {
 
 /**
  * Spawn the dsh web server and return its tokenized URL.
- * Runtime source: the installer-bundled zip (packaged) when present, else
- * the repo checkout (dev). The URL line ("dsh web: http://…?token=…") is
+ * Runtime source: the installer-bundled loose runtime (packaged) when
+ * present, else the repo checkout (dev). The URL line ("dsh web: http://…?token=…") is
  * parsed from stdout; newer dsh may append " (LAN: http://…)" to the line,
  * so only the first token is taken as the URL.
  */
@@ -403,6 +404,54 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
             }
         }
     }
+    // Persist the exact launch shape next to the stderr log: when the child
+    // node reports a mangled argv (e.g. EISDIR lstat 'D:'), this file shows
+    // what we actually tried to exec plus every path/env that fed into it.
+    let launch_diag = {
+        let mut d = String::new();
+        d.push_str(&format!(
+            "resource_dir: {}\n",
+            app.path()
+                .resource_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<err: {e}>"))
+        ));
+        d.push_str(&format!(
+            "node: {} exists={} is_file={}\n",
+            rt.node.display(),
+            rt.node.exists(),
+            rt.node.is_file()
+        ));
+        d.push_str(&format!(
+            "dsh_bin: {} exists={} is_file={}\n",
+            rt.dsh_bin.display(),
+            rt.dsh_bin.exists(),
+            rt.dsh_bin.is_file()
+        ));
+        d.push_str(&format!("dsh_cwd: {}\n", rt.dsh_cwd.display()));
+        d.push_str(&format!("home: {}\n", rt.home.display()));
+        let mut parts = vec![cmd.get_program().to_string_lossy().into_owned()];
+        parts.extend(cmd.get_args().map(|a| a.to_string_lossy().into_owned()));
+        d.push_str(&format!("command_line: {parts:?}\n"));
+        d.push_str(&format!("port: {port}\n"));
+        if let Ok(cwd) = std::env::current_dir() {
+            d.push_str(&format!("parent_cwd: {}\n", cwd.display()));
+        }
+        // Per-drive cwd variables (=C:=..., =D:=...) that cmd.exe sessions
+        // leak into child environments and that mangle drive-relative paths.
+        for (k, v) in std::env::vars_os() {
+            let k = k.to_string_lossy().into_owned();
+            if k.starts_with('=') {
+                d.push_str(&format!("drive-env: {k}={}\n", v.to_string_lossy()));
+            }
+        }
+        if let Some(p) = std::env::var_os("PATH") {
+            let head: String = p.to_string_lossy().chars().take(400).collect();
+            d.push_str(&format!("parent_path_head: {head}\n"));
+        }
+        d
+    };
+    let _ = std::fs::write(rt.home.join("dsh-web-launch.log"), launch_diag);
     // Keep stderr on disk: when dsh fails to boot (e.g. bundle resolution),
     // the port wait times out with no clue — this log holds the real error.
     let stderr_log = std::fs::OpenOptions::new()
@@ -439,11 +488,16 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
         });
     }
 
-    if !wait_port("127.0.0.1", port, Duration::from_secs(60)) {
+    // 180s on Windows (dsh-desktop parity): with zero first-boot unpacking
+    // the wait is pure node/dsh boot, but cold module resolution under AV
+    // scanning on slow disks can still take a minute+; never kill a healthy
+    // boot early.
+    if !wait_port("127.0.0.1", port, Duration::from_secs(180)) {
         let _ = child.kill();
         return Err(format!(
-            "dsh web did not listen on port {port} within 60s; real error: {}",
-            rt.home.join("dsh-web-stderr.log").display()
+            "dsh web did not listen on port {port} within 180s; real error: {}; launch diag: {}",
+            rt.home.join("dsh-web-stderr.log").display(),
+            rt.home.join("dsh-web-launch.log").display()
         ));
     }
     let deadline = Instant::now() + Duration::from_secs(10);

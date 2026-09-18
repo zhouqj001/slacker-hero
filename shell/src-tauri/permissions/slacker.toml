@@ -7,7 +7,7 @@
 # references them for the main + tea windows.
 
 [[permission]]
-identifier = "allow-slacker-shell"
+identifier = "allow-slacker-hero"
 description = "Boot/read the dsh runtime (landing page rides the CLI static server origin http://127.0.0.1:1430 in tauri dev, which the ACL treats as remote)"
 commands.allow = ["shell_boot", "shell_url"]
 

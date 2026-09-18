@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "slacker-shell",
+  "productName": "slacker-hero",
   "version": "0.0.1",
-  "identifier": "com.slacker.shell",
+  "identifier": "com.slacker.hero",
   "build": {
     "frontendDist": "../ui",
     "beforeDevCommand": "node scripts/standalone-assets.cjs",
@@ -27,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "app", "dmg"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -35,6 +35,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/*", "resources/runtime/dsh-runtime.zip"]
+    "resources": [
+      "resources/*",
+      "resources/vendor/**/*",
+      "resources/runtime/**/*"
+    ]
   }
 }

@@ -1,15 +1,20 @@
-/* Build the self-contained dsh runtime zip bundled into installers.
+/* Stage the self-contained dsh runtime as a LOOSE resource tree bundled into
+ * installers.
  *
  * The packaged app must boot with ZERO machine dependencies (no system node,
  * no pnpm, no network). This script assembles everything the runtime needs
- * into one deflate zip — shell/src-tauri/resources/runtime/dsh-runtime.zip —
- * which tauri bundles as a resource and the shell extracts on first boot
- * (see spawn_dsh_web / packaged_runtime in src-tauri/src/lib.rs).
+ * into src-tauri/resources/runtime/ — which tauri bundles as plain files
+ * into the installer. First boot runs node + dsh straight from the install
+ * dir with ZERO unpacking (the dsh-desktop approach: "asar": false); only
+ * the small profile template is copied into the persistent home on boot
+ * (see packaged_runtime / materialize_profile in src-tauri/src/lib.rs).
  *
- * Zip layout (paths are hard-coded in lib.rs — keep in sync):
+ * Layout (paths are hard-coded in lib.rs — keep in sync):
  *   node/<node-dir>/...        node binary per platform dir (win32-x64, darwin-arm64, darwin-x64, linux-x64)
  *   dsh/node_modules/...       @deepseek-ai/dsh runtime (vendor/dsh-runtime install)
  *   profiles/slacker/...       dsh profile template + hoisted node_modules (bundles pre-installed)
+ *   profiles/.pack-version     "<files>:<bytes>" stamp of the template; keys
+ *                              the shell's re-copy-on-upgrade marker
  *
  * Usage: node scripts/pack-runtime.cjs [--target <rust-target>] (default: host)
  *   aarch64-pc-windows-msvc intentionally ships the x64 runtime: node-x64 runs
@@ -20,7 +25,7 @@
  * node_modules/.pack-hoisted for the profile); node dist archives are cached
  * under src-tauri/target/runtime-pack/.
  *
- * Depends on devDependencies: archiver (zip write), extract-zip (win node dist).
+ * Depends on devDependencies: extract-zip (win node dist).
  * Runs as tauri's beforeBuildCommand (cwd = shell/) and via `npm run pack:runtime`.
  */
 'use strict';
@@ -31,12 +36,11 @@ const os = require('node:os');
 const path = require('node:path');
 const https = require('node:https');
 
-const archiver = require('archiver');
 const extractZip = require('extract-zip');
 
 // >= 22.18.0 required: dsh's bin.js gates on `import.meta.main`, which Node
 // only added in v22.18.0/v24.2.0 — older nodes exit silently (exit 0, no
-// output, no listener) and the shell reports a 60s boot timeout.
+// output, no listener) and the shell reports a boot timeout.
 const NODE_VERSION = process.env.RUNTIME_NODE_VERSION || '22.23.2';
 
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -44,7 +48,7 @@ const shellDir = path.resolve(__dirname, '..');
 const runtimeDir = path.join(repoRoot, 'vendor', 'dsh-runtime');
 const profileDir = path.join(shellDir, 'dsh-profile', 'slacker');
 const cacheDir = path.join(shellDir, 'src-tauri', 'target', 'runtime-pack');
-const outZip = path.join(shellDir, 'src-tauri', 'resources', 'runtime', 'dsh-runtime.zip');
+const outDir = path.join(shellDir, 'src-tauri', 'resources', 'runtime');
 
 const log = (m) => console.log(`[pack-runtime] ${m}`);
 const fail = (m) => { console.error(`[pack-runtime] ERROR ${m}`); process.exit(1); };
@@ -118,30 +122,29 @@ async function extractArchive (archivePath, kind) {
   return into;
 }
 
-/** Zip `root` under `prefix`, skipping dsh-managed runtime state. The profile
- * template must ship as a plain file tree: `.dsh-module-fallback` is
- * materialized/owned by dsh at boot (healProfileModuleFallback) and any real
- * directory found there makes dsh abort with "exists and is not a symlink" —
- * shipping a template copy of it bricks first boot (v0.0.1 regression).
- * archiver's a.directory() has no exclude, hence the manual walk. */
-const PROFILE_ZIP_SKIP = new Set(['.dsh-module-fallback']);
-
-function addTree (a, root, prefix) {
-  for (const ent of fs.readdirSync(root, { withFileTypes: true })) {
-    if (PROFILE_ZIP_SKIP.has(ent.name)) continue;
-    const src = path.join(root, ent.name);
-    const inZip = `${prefix}/${ent.name}`;
-    if (ent.isDirectory()) {
-      addTree(a, src, inZip);
-      if (fs.readdirSync(src).length === 0) a.directory(src, inZip); // keep empty dirs
-    } else if (ent.isFile() || ent.isSymbolicLink()) {
-      // data must be an object: archiver's string-name shorthand never gets
-      // normalized to { name } for file(), and zip-stream then rejects the
-      // entry ("entry name must be a non-empty string value").
-      a.file(src, { name: inZip });
+/** Stats (files, bytes) of a file tree, recursing through real dirs.
+ * Symlinks are dereferenced (stat) so stamps match what actually lands on
+ * disk after the dereferencing copies below. */
+function treeStats (root) {
+  let files = 0;
+  let bytes = 0;
+  const walk = (dir) => {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else { files += 1; bytes += fs.statSync(p).size; }
     }
-  }
+  };
+  walk(root);
+  return { files, bytes };
 }
+
+/** The profile template must ship as a plain file tree: `.dsh-module-fallback`
+ * is materialized/owned by dsh at boot (healProfileModuleFallback) and any
+ * real directory found there makes dsh abort with "exists and is not a
+ * symlink" — shipping a template copy of it bricks first boot (v0.0.1
+ * regression). */
+const PROFILE_SKIP = new Set(['.dsh-module-fallback']);
 
 async function main () {
   const target = parseTarget();
@@ -189,23 +192,64 @@ async function main () {
     nodeDirs.push([dist.dir, extracted]);
   }
 
-  // 5. Zip it all (deflate). Directories stream straight from their source
-  //    roots under their in-zip prefix — no staging copy.
-  fs.mkdirSync(path.dirname(outZip), { recursive: true });
-  await new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(outZip);
-    const a = archiver('zip', { zlib: { level: 9 } });
-    output.on('close', resolve);
-    a.on('warning', (e) => console.warn(`[pack-runtime] warn: ${e.message}`));
-    a.on('error', reject);
-    a.pipe(output);
-    for (const [dir, extracted] of nodeDirs) a.directory(extracted, `node/${dir}`);
-    a.directory(path.join(runtimeDir, 'node_modules'), 'dsh/node_modules');
-    addTree(a, profileDir, 'profiles/slacker');
-    a.finalize();
+  // 5. Stage the LOOSE resource tree (no zip). Tauri bundles it as plain
+  //    files, so first boot runs node + dsh straight from the install dir
+  //    with zero unpacking. dereference: true flattens npm's .bin symlinks
+  //    into real files (installer bundlers and the packed layout both stay
+  //    symlink-free — same guarantee the old zip gave).
+  //
+  //    Idempotent: the tree is rebuilt only when the sources' fingerprints
+  //    (file counts + byte totals, via treeStats) differ from the
+  //    .packed-stamp recorded after the last successful copy — copying
+  //    ~40k files takes tens of minutes on slow disks, so rebuilds skip it.
+  const stamp = JSON.stringify({
+    target,
+    node: nodeDirs.map(([dir, extracted]) => `${dir}=${path.basename(extracted)}`).join(','),
+    dsh: treeStats(path.join(runtimeDir, 'node_modules')),
+    profile: treeStats(profileDir),
   });
-  const mb = (fs.statSync(outZip).size / 1048576).toFixed(1);
-  log(`done: ${outZip} (${mb} MB) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  const stampPath = path.join(outDir, '.packed-stamp');
+  const fresh = fs.existsSync(stampPath) && fs.readFileSync(stampPath, 'utf8') === `${stamp}\n`;
+  if (fresh) {
+    log('runtime tree already packed and up to date — skipping copy');
+  } else {
+    // A tree without a stamp may be the tail of an interrupted run: it is
+    // trusted only when the last-written artifacts are all present
+    // (.pack-version is written after every copy step completes).
+    const nodeBin = process.platform === 'win32' ? 'node.exe' : path.join('bin', 'node');
+    const looksComplete = fs.existsSync(path.join(outDir, 'profiles', '.pack-version')) &&
+      fs.existsSync(path.join(outDir, 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')) &&
+      fs.existsSync(path.join(outDir, 'node', nodeDists(target)[0].dir, nodeBin));
+    if (looksComplete) {
+      log('runtime tree complete but unstamped — trusting it, recording stamp');
+    } else {
+      fs.rmSync(outDir, { recursive: true, force: true, maxRetries: 3 });
+      fs.mkdirSync(outDir, { recursive: true });
+      for (const [dir, extracted] of nodeDirs) {
+        fs.cpSync(extracted, path.join(outDir, 'node', dir), { recursive: true, dereference: true });
+      }
+      fs.cpSync(path.join(runtimeDir, 'node_modules'), path.join(outDir, 'dsh', 'node_modules'),
+        { recursive: true, dereference: true });
+
+      // Profile template (skips dsh-managed state), then stamp its totals
+      // next to it: lib.rs keys the persistent-home marker on this file to
+      // decide first-boot copy vs reuse across upgrades.
+      const profileStats = treeStats(profileDir);
+      fs.cpSync(profileDir, path.join(outDir, 'profiles', 'slacker'), {
+        recursive: true,
+        dereference: true,
+        filter: (src) => !PROFILE_SKIP.has(path.basename(src)),
+      });
+      fs.writeFileSync(path.join(outDir, 'profiles', '.pack-version'),
+        `${profileStats.files}:${profileStats.bytes}\n`);
+      log(`profile template: ${profileStats.files} files / ${(profileStats.bytes / 1048576).toFixed(1)} MB`);
+    }
+    fs.writeFileSync(stampPath, `${stamp}\n`);
+  }
+
+  const total = treeStats(outDir);
+  const mb = (total.bytes / 1048576).toFixed(1);
+  log(`done: ${outDir} (${total.files} files, ${mb} MB) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 
 main().catch((e) => fail(e.stack || e.message));
