@@ -52,6 +52,11 @@
           '正在清理旧版运行时文件（可能需要几分钟）…'
         return
       }
+      if (p.phase === 'install') {
+        document.getElementById('status').textContent =
+          '正在恢复已安装的插件（需要联网，可能需要几分钟）…'
+        return
+      }
       const { done, total } = p
       document.getElementById('status').textContent = done >= total
         ? '运行时解压完成，正在启动…'

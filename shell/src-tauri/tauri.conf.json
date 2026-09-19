@@ -5,7 +5,7 @@
   "identifier": "com.slacker.hero",
   "build": {
     "frontendDist": "../ui",
-    "beforeDevCommand": "node scripts/standalone-assets.cjs",
+    "beforeDevCommand": "node scripts/standalone-assets.cjs && node scripts/pack-runtime.cjs --tgz-only",
     "beforeBuildCommand": "node scripts/standalone-assets.cjs && node scripts/pack-runtime.cjs"
   },
   "app": {

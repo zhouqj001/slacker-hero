@@ -70,6 +70,185 @@ struct DshRuntime {
     dsh_bin: std::path::PathBuf,
     dsh_cwd: std::path::PathBuf,
     home: std::path::PathBuf,
+    /// Vendored pnpm shim dir (resources/runtime/pnpm, staged by
+    /// pack-runtime.cjs) in packaged builds: prepended to the dsh child's
+    /// PATH so dshmarket can install/upgrade plugins on machines with no
+    /// global pnpm. None in dev, where the real pnpm is on PATH.
+    pnpm_dir: Option<std::path::PathBuf>,
+}
+
+/** Vendored pnpm program: the shim inside pnpm_dir (shims are the only pnpm
+ * shape shipped; std::process::Command routes .cmd through cmd.exe). */
+fn pnpm_program(pnpm_dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = pnpm_dir;
+        pnpm_dir.join("pnpm.cmd")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        pnpm_dir.join("pnpm")
+    }
+}
+
+/** Run the vendored pnpm capturing stdout; hides the console window (GUI
+ * subsystem spawns must not flash a terminal). */
+#[allow(unused_mut)]
+fn pnpm_output(
+    pnpm_dir: &std::path::Path,
+    args: &[&str],
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<std::process::Output, String> {
+    let mut cmd = Command::new(pnpm_program(pnpm_dir));
+    cmd.args(args)
+        .current_dir(cwd)
+        // Keep pnpm's global-bin state inside the app's home dir instead of
+        // scattering it over the user's real profile.
+        .env("PNPM_HOME", home.join("pnpm"))
+        .stdin(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.output().map_err(|e| format!("spawn vendored pnpm: {e}"))
+}
+
+/**
+ * Patch the materialized profile's node_modules/.modules.yaml for THIS
+ * machine. The template records the pack machine's pnpm store paths
+ * (storeDir / virtualStoreDir), and pnpm refuses every install/mutation
+ * whose store doesn't match that record (ERR_PNPM_UNEXPECTED_STORE) — a
+ * shipped template would brick marketplace installs on any other machine.
+ * Ask the vendored pnpm which store it would use here and rewrite the two
+ * keys (the file is JSON despite the name). cwd = the home ROOT: same
+ * volume as the profile (so the per-drive default store matches) but
+ * outside node_modules, so the recorded foreign store can't poison the
+ * answer.
+ */
+fn calibrate_profile_store(
+    home: &std::path::Path,
+    profile: &std::path::Path,
+    pnpm_dir: &std::path::Path,
+) -> Result<(), String> {
+    let modules = profile.join("node_modules").join(".modules.yaml");
+    if !modules.is_file() {
+        return Ok(());
+    }
+    let out = pnpm_output(pnpm_dir, &["store", "path"], home, home)?;
+    let store = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    if !out.status.success() || store.is_empty() {
+        return Err(format!(
+            "pnpm store path failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let raw = std::fs::read_to_string(&modules)
+        .map_err(|e| format!("read {}: {e}", modules.display()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse {}: {e}", modules.display()))?;
+    v["storeDir"] = serde_json::json!(store);
+    v["virtualStoreDir"] =
+        serde_json::json!(profile.join("node_modules").join(".pnpm").display().to_string());
+    std::fs::write(&modules, format!("{}\n", serde_json::to_string_pretty(&v).unwrap()))
+        .map_err(|e| format!("write {}: {e}", modules.display()))?;
+    Ok(())
+}
+
+/** Merge deps the user installed from the marketplace after this build
+ * (package.json keys absent from the template, plus their dsh bundle
+ * entries) into the freshly copied template package.json. Returns true when
+ * something was merged (i.e. an install is needed). */
+fn merge_user_plugins(old_profile: &std::path::Path, new_profile: &std::path::Path) -> Result<bool, String> {
+    let old_path = old_profile.join("package.json");
+    if !old_path.is_file() {
+        return Ok(false);
+    }
+    let old: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&old_path).map_err(|e| format!("read old package.json: {e}"))?,
+    )
+    .map_err(|e| format!("parse old package.json: {e}"))?;
+    let new_path = new_profile.join("package.json");
+    let mut new: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&new_path).map_err(|e| format!("read package.json: {e}"))?,
+    )
+    .map_err(|e| format!("parse package.json: {e}"))?;
+
+    let mut added = false;
+    {
+        let new_deps = new["dependencies"]
+            .as_object_mut()
+            .expect("template package.json has dependencies");
+        if let Some(old_deps) = old["dependencies"].as_object() {
+            for (k, v) in old_deps {
+                if !new_deps.contains_key(k) {
+                    new_deps.insert(k.clone(), v.clone());
+                    added = true;
+                }
+            }
+        }
+    }
+    // Bundle list: template order wins; append user-added bundles only.
+    if let Some(old_bundles) = old["dsh"]["profile"]["bundles"].as_array() {
+        let new_bundles = new["dsh"]["profile"]["bundles"]
+            .as_array_mut()
+            .expect("template package.json has dsh.profile.bundles");
+        for b in old_bundles {
+            if !new_bundles.contains(b) {
+                new_bundles.push(b.clone());
+                added = true;
+            }
+        }
+    }
+    if !added {
+        return Ok(false);
+    }
+    std::fs::write(&new_path, format!("{}\n", serde_json::to_string_pretty(&new).unwrap()))
+        .map_err(|e| format!("write merged package.json: {e}"))?;
+    Ok(true)
+}
+
+/** After an upgrade-copy: carry the user's dsh config (cordis.patch.yml /
+ * cordis.yml hold their plugin enable states and settings — the template
+ * copies only carry factory defaults) back over the fresh template files. */
+fn restore_user_config(old_profile: &std::path::Path, new_profile: &std::path::Path) {
+    for name in ["cordis.patch.yml", "cordis.yml"] {
+        let from = old_profile.join(name);
+        if from.is_file() {
+            let _ = std::fs::copy(&from, new_profile.join(name));
+        }
+    }
+}
+
+/** Reinstall the profile after user plugins were merged back in (vendored
+ * pnpm, network available; their store is the machine default so no store
+ * calibration is needed — the install rewrites .modules.yaml itself). */
+fn reinstall_profile(
+    home: &std::path::Path,
+    profile: &std::path::Path,
+    pnpm_dir: &std::path::Path,
+) -> Result<(), String> {
+    let out = pnpm_output(
+        pnpm_dir,
+        &["install", "--config.auto-install-peers=false", "--no-frozen-lockfile"],
+        profile,
+        home,
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "pnpm install failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /** Copy `src` into `dst` recursively (dirs created; symlinks dereferenced by
@@ -111,20 +290,44 @@ fn copy_tree_inner(
     Ok(())
 }
 
+/** Newest `.old-<ts>` stash under profile_root, if any (crash leftovers). */
+fn newest_old_stash(profile_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(profile_root).ok()?.flatten() {
+        let name = entry.file_name();
+        if let Some(ts) = name.to_string_lossy().strip_prefix(".old-").and_then(|t| t.parse::<u64>().ok()) {
+            if best.as_ref().map(|(b, _)| ts > *b).unwrap_or(true) {
+                best = Some((ts, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /** Copy the bundled profile template (resources/runtime/profiles/slacker)
  * into the persistent dsh home on first boot and after template changes.
  * Only this tree is materialized: dsh writes into the profile (plugin
  * installs, .dsh-module-fallback healing), while node + the dsh node_modules
  * run straight from the install dir with zero first-boot unpacking.
  * Freshness is keyed by the .pack-version stamp (template file/byte totals
- * written by pack-runtime.cjs), mirroring the old zip fingerprint semantics:
- * a matching marker skips the copy entirely, a changed installer re-copies
- * only the profile. The copy is still thousands of small files (minutes
- * under AV scanning) — report progress so it never reads as a hang. */
+ * written by pack-runtime.cjs): a matching marker skips the copy entirely,
+ * a changed installer re-copies only the profile.
+ *
+ * Upgrades reconcile instead of wiping: the old profile is renamed aside
+ * (cheap), the fresh template copied in, then the user's dsh config and
+ * marketplace-installed plugins are merged back (a network pnpm install
+ * runs only when the user actually had extra plugins). The vendored pnpm
+ * is what makes any of that work off the pack machine — see
+ * calibrate_profile_store. The copied .modules.yaml store record is
+ * calibrated for THIS machine before anything touches pnpm again. Failure
+ * at any point rolls back to the untouched old profile; success drops the
+ * stash in the background (minutes of I/O under AV scanning). */
 fn materialize_profile(
     stamp_path: &std::path::Path,
     template: &std::path::Path,
     profile_root: &std::path::Path,
+    home: &std::path::Path,
+    pnpm_dir: &std::path::Path,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let profile_dst = profile_root.join("slacker");
@@ -140,38 +343,101 @@ fn materialize_profile(
     if fresh {
         return Ok(());
     }
+
+    // Crash recovery: a previous upgrade may have died between stashing the
+    // old profile and finishing the fresh copy — restore the newest stash so
+    // the user's plugins/config survive, then fall through to a normal
+    // reconciled upgrade.
+    if !profile_dst.exists() {
+        if let Some(stash) = newest_old_stash(profile_root) {
+            let _ = std::fs::rename(&stash, &profile_dst);
+        }
+    }
+
+    let mut stashed: Option<std::path::PathBuf> = None;
     if profile_dst.exists() {
-        // Leftover from a previous installer: wipe before copying so files
-        // removed upstream cannot linger. Surface it — the wipe alone is
-        // seconds-to-minutes of I/O under AV scanning.
+        // Surface it — stashing + copying is seconds-to-minutes under AV.
         let _ = app.emit(
             "slacker:boot-progress",
             serde_json::json!({ "phase": "cleanup" }),
         );
-        std::fs::remove_dir_all(&profile_dst).map_err(|e| format!("clean old profile: {e}"))?;
-    }
-    std::fs::create_dir_all(&profile_dst).map_err(|e| format!("create profile dir: {e}"))?;
-    let mut last_emit = Instant::now();
-    let mut progress = || {
-        if last_emit.elapsed() >= Duration::from_millis(250) {
-            last_emit = Instant::now();
-            let _ = app.emit(
-                "slacker:boot-progress",
-                serde_json::json!({ "done": 0, "total": total }),
-            );
+        // Sweep stashes left by earlier failed/crashed upgrades first, so
+        // the timestamped rename target below is always free.
+        if let Ok(entries) = std::fs::read_dir(profile_root) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".old-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
         }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stash = profile_root.join(format!(".old-{ts}"));
+        std::fs::rename(&profile_dst, &stash).map_err(|e| format!("stash old profile: {e}"))?;
+        stashed = Some(stash);
+    }
+
+    let install = || -> Result<(), String> {
+        std::fs::create_dir_all(&profile_dst).map_err(|e| format!("create profile dir: {e}"))?;
+        let mut last_emit = Instant::now();
+        let mut progress = || {
+            if last_emit.elapsed() >= Duration::from_millis(250) {
+                last_emit = Instant::now();
+                let _ = app.emit(
+                    "slacker:boot-progress",
+                    serde_json::json!({ "done": 0, "total": total }),
+                );
+            }
+        };
+        // `done` inside the closure can't see copy_tree's counter; emit a
+        // coarse "working" tick (done:0) — the splash only needs motion, and
+        // the profile copy is bounded by the stamp total anyway.
+        let (files, _) = copy_tree(template, &profile_dst, &mut progress)
+            .map_err(|e| format!("materialize profile template: {e}"))?;
+        let _ = app.emit(
+            "slacker:boot-progress",
+            serde_json::json!({ "done": total.max(files), "total": total.max(files) }),
+        );
+        // A template carrying the pack machine's store record would brick
+        // every later pnpm run (ERR_PNPM_UNEXPECTED_STORE) — rewrite the
+        // two store keys for this machine before anything installs.
+        calibrate_profile_store(home, &profile_dst, pnpm_dir)?;
+        // Carry the user's config + marketplace plugins over from the stash.
+        if let Some(old) = &stashed {
+            restore_user_config(old, &profile_dst);
+            if merge_user_plugins(old, &profile_dst)? {
+                let _ = app.emit(
+                    "slacker:boot-progress",
+                    serde_json::json!({ "phase": "install" }),
+                );
+                reinstall_profile(home, &profile_dst, pnpm_dir)?;
+            }
+        }
+        // Marker last: a rollback below leaves the old stamp in place, so
+        // the next boot retries the upgrade against the restored profile.
+        std::fs::write(&marker, stamp).map_err(|e| format!("write profile marker: {e}"))?;
+        Ok(())
     };
-    // `done` inside the closure can't see copy_tree's counter; emit a
-    // coarse "working" tick (done:0) — the splash only needs motion, and
-    // the profile copy is bounded by the stamp total anyway.
-    let (files, _) = copy_tree(template, &profile_dst, &mut progress)
-        .map_err(|e| format!("materialize profile template: {e}"))?;
-    let _ = app.emit(
-        "slacker:boot-progress",
-        serde_json::json!({ "done": total.max(files), "total": total.max(files) }),
-    );
-    std::fs::write(&marker, stamp).map_err(|e| format!("write profile marker: {e}"))?;
-    Ok(())
+
+    match install() {
+        Ok(()) => {
+            if let Some(old) = stashed {
+                std::thread::spawn(move || {
+                    let _ = std::fs::remove_dir_all(old);
+                });
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&profile_dst);
+            if let Some(old) = stashed {
+                let _ = std::fs::rename(&old, &profile_dst);
+            }
+            Err(e)
+        }
+    }
 }
 
 /** Runtime from the installer bundle (pack-runtime.cjs loose tree under
@@ -241,6 +507,8 @@ fn packaged_runtime(app: &tauri::AppHandle) -> Option<Result<DshRuntime, String>
             &runtime_dir.join("profiles").join(".pack-version"),
             &runtime_dir.join("profiles").join("slacker"),
             &home.join("profiles"),
+            &home,
+            &runtime_dir.join("pnpm"),
             app,
         )?;
         let dsh_bin = runtime_dir
@@ -260,6 +528,7 @@ fn packaged_runtime(app: &tauri::AppHandle) -> Option<Result<DshRuntime, String>
             // routes to DSH_HOME, nothing is written to the cwd itself.
             dsh_cwd: runtime_dir.join("dsh"),
             home,
+            pnpm_dir: Some(runtime_dir.join("pnpm")),
         })
     })())
 }
@@ -359,7 +628,8 @@ fn dev_runtime() -> Result<DshRuntime, String> {
                 .into(),
         );
     }
-    Ok(DshRuntime { node: "node".into(), dsh_bin, dsh_cwd: repo_root, home })
+    // Dev uses the machine's own pnpm (already on PATH) — nothing vendored.
+    Ok(DshRuntime { node: "node".into(), dsh_bin, dsh_cwd: repo_root, home, pnpm_dir: None })
 }
 
 /**
@@ -390,14 +660,27 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
         .current_dir(&rt.dsh_cwd)
         .env("DSH_HOME", &rt.home)
         .stdout(Stdio::piped());
+    // Keep pnpm's global-bin state inside the app home, never the user's
+    // real profile (marketplace installs shell out to the vendored pnpm).
+    if rt.pnpm_dir.is_some() {
+        cmd.env("PNPM_HOME", rt.home.join("pnpm"));
+    }
     // Bundled node: prepend its dir to the child PATH so anything the dsh
     // runtime shells out to (`node`, file-archivers, …) resolves the pinned
     // binary rather than whatever happens to be installed on the machine.
     if rt.node.is_absolute() {
         if let Some(node_dir) = rt.node.parent() {
             let path_env = std::env::var_os("PATH").unwrap_or_default();
+            let mut head = vec![node_dir.to_path_buf()];
+            // Vendored pnpm shim right after node: dshmarket's installs and
+            // upgrades resolve `pnpm` from here on machines without a global
+            // one — the previously fatal ERR_PNPM_UNEXPECTED_STORE case is
+            // gone (calibrated profile) and the binary itself now exists.
+            if let Some(pnpm_dir) = &rt.pnpm_dir {
+                head.push(pnpm_dir.clone());
+            }
             let prepended = std::env::join_paths(
-                std::iter::once(node_dir.to_path_buf()).chain(std::env::split_paths(&path_env)),
+                head.into_iter().chain(std::env::split_paths(&path_env)),
             );
             if let Ok(pre) = prepended {
                 cmd.env("PATH", pre);

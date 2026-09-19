@@ -5,6 +5,9 @@
   "private": true,
   "type": "module",
   "main": "lib/index.mjs",
+  "files": [
+    "lib"
+  ],
   "exports": {
     ".": "./lib/index.mjs",
     "./invariant": "./lib/invariant.mjs",

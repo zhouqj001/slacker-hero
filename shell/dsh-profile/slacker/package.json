@@ -2,8 +2,8 @@
   "name": "dsh-profile-slacker",
   "private": true,
   "dependencies": {
-    "@slacker/novel": "file:../../../shell/plugins/novel",
-    "@slacker/ui-slacker": "file:../../../shell/plugins/ui-slacker",
+    "@slacker/novel": "file:./deps/slacker-novel-0.1.0.tgz",
+    "@slacker/ui-slacker": "file:./deps/slacker-ui-slacker-0.3.0.tgz",
     "dsh-better-sidebar": "^0.18.0",
     "@dely0/dsh-personal-workbench": "^1.10.1",
     "dshmarket": "^1.45.0",
