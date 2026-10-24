@@ -9,6 +9,8 @@ export type SlackerKey =
   | 'zone.boss'
   | 'zone.close'
   | 'zone.min'
+  | 'zone.more'
+  | 'zone.restartHarness'
   | 'tab.novel'
   | 'tab.game'
   | 'tab.stock'
@@ -112,6 +114,8 @@ export const zh = {
   'zone.boss': '老板键',
   'zone.close': '回到工作',
   'zone.min': '最小化',
+  'zone.more': '更多',
+  'zone.restartHarness': '重启 harness',
   'tab.novel': '小说',
   'tab.game': '游戏',
   'tab.stock': '股票',
@@ -216,6 +220,8 @@ export const en = {
   'zone.boss': 'boss key',
   'zone.close': 'Back to work',
   'zone.min': 'Minimize',
+  'zone.more': 'More',
+  'zone.restartHarness': 'Restart harness',
   'tab.novel': 'Novels',
   'tab.game': 'Games',
   'tab.stock': 'Stocks',

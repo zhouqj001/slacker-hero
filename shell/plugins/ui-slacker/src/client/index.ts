@@ -14,7 +14,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 // plugin's settings-page registration type-checks against the canonical owner.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import { createElement } from 'react'
+import { createRoot } from 'react-dom/client'
 import { SlackerOverlay } from './SlackerOverlay.tsx'
+import { MainTitlebar } from './MainTitlebar.tsx'
 import { TeaSettings } from './TeaSettings.tsx'
 import { installThemeBridge } from './theme-bridge.ts'
 import { en, zh, type SlackerKey } from './locales.ts'
@@ -74,6 +77,26 @@ export function apply(ctx: ClientContext): void {
       }, TeaSettings)),
     'ui-slacker: settings section registration',
   )
+
+  // 主窗自绘标题栏（decorations:false 后的标题/⋯/窗控一行）：直接挂
+  // body，不占 dsh 布局树。仅壳内挂载——纯浏览器 dev 无 __TAURI__，
+  // 保持全高页面。client.js 只在主窗 dsh 页运行，独立窗有自己的头部。
+  if ('__TAURI__' in window) {
+    const host = document.createElement('div')
+    host.dataset.slackerTitlebar = ''
+    document.body.appendChild(host)
+    ctx.effect(
+      () => {
+        const root = createRoot(host)
+        root.render(createElement(MainTitlebar, { t }))
+        return () => {
+          root.unmount()
+          host.remove()
+        }
+      },
+      'ui-slacker: main titlebar mount',
+    )
+  }
 }
 
 // Re-export for component-spec typing; not part of the plugin's runtime API.
