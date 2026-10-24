@@ -37,4 +37,6 @@ cookies.txt
 .smoke-body.json
 .smoke-cookies.txt
 shell/dsh-profile/slacker/.cache/
+.smoke-*
+.workbuddy/
 # 有意提交: shell/src-tauri/Cargo.lock 与 shell/plugins/*/pnpm-lock.yaml
