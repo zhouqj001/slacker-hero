@@ -1,0 +1,42 @@
+{
+  "name": "@slacker/media",
+  "description": "Media studio plugin: topic, article, cover, publish, review loop for the slacker shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.mjs",
+  "files": [
+    "lib"
+  ],
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "playwright-core": "^1.63.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "file:../../../vendor/dsh-runtime/node_modules/@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-home-paths": "file:../../../vendor/dsh-runtime/node_modules/@deepseek-ai/dsh-home-paths",
+    "@deepseek-ai/dsh-storage": "file:../../../vendor/dsh-runtime/node_modules/@deepseek-ai/dsh-storage",
+    "@deepseek-ai/dsh-storage-domain": "file:../../../vendor/dsh-runtime/node_modules/@deepseek-ai/dsh-storage-domain",
+    "@types/node": "^22.10.0",
+    "@types/react": "~18.3.1",
+    "lightningcss": "^1.32.0",
+    "playwright-core": "^1.63.0",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.2",
+    "zod": "^4.6.5"
+  },
+  "scripts": {
+    "bundle": "tsdown",
+    "watch": "tsdown --watch"
+  }
+}
