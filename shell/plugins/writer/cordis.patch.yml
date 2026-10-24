@@ -1,0 +1,7 @@
+# dsh bundle patch: inserts the writer plugin into a profile's layer stack.
+# Ships with the package (dsh.bundle.patch), so the profile's user
+# cordis.patch.yml needs no writer insert row — listing @slacker/writer in
+# dsh.profile.bundles + dependencies composes this insert at boot.
+- insert:
+    - id: writer
+      name: '@slacker/writer'
