@@ -10,6 +10,23 @@
       background: #18181b; color: #e4e4e7;
       font: 14px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
     }
+    body { box-sizing: border-box; padding-top: 38px; }
+    /* 自绘标题栏：主窗 decorations:false，标题/窗控一行（与 dsh 页
+       MainTitlebar 同规格）。整条可拖拽，双击最大化由 Tauri 处理。 */
+    #titlebar {
+      position: fixed; top: 0; left: 0; right: 0; height: 38px; z-index: 9999;
+      display: flex; align-items: stretch; user-select: none;
+    }
+    #titlebar .t {
+      flex: 1; display: flex; align-items: center; padding-left: 14px;
+      font-size: 12px; opacity: .55;
+    }
+    #titlebar button {
+      width: 44px; height: 100%; border: none; border-radius: 0; padding: 0;
+      background: transparent; color: inherit; font-size: 13px; opacity: .7;
+    }
+    #titlebar button:hover { background: #3f3f46; opacity: 1; }
+    #titlebar button.close:hover { background: #e81123; color: #fff; }
     #splash {
       height: 100%; display: flex; flex-direction: column;
       align-items: center; justify-content: center; gap: 18px;
@@ -21,6 +38,22 @@
     }
     @keyframes pulse { 50% { opacity: .45; transform: scale(.94); } }
     .status { opacity: .7; }
+    /* 不确定进度条：dsh 冷启动 30s~2min 无内部进度可报，让等待看起来活着 */
+    .bar {
+      width: 220px; height: 3px; border-radius: 2px; overflow: hidden;
+      background: #27272a;
+    }
+    .bar i {
+      display: block; width: 40%; height: 100%; border-radius: 2px;
+      background: linear-gradient(90deg, #38bdf8, #6366f1);
+      animation: slide 1.2s ease-in-out infinite;
+    }
+    @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(350%); } }
+    /* dsh 启动日志的最新一行：真实进度（加载到哪个插件/阶段都在这） */
+    .bootlog {
+      max-width: 76%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font: 11px/1.9 Consolas, "Cascadia Mono", monospace; opacity: .4;
+    }
     .error {
       max-width: 520px; padding: 12px 16px; border-radius: 8px;
       background: rgba(239,68,68,.12); color: #fca5a5; display: none;
@@ -34,9 +67,17 @@
   </style>
 </head>
 <body>
+  <div id="titlebar">
+    <div class="t" data-tauri-drag-region>浮生半日</div>
+    <button title="最小化" onclick="window.__TAURI__.window.getCurrentWindow().minimize()">─</button>
+    <button title="最大化 / 还原" onclick="window.__TAURI__.window.getCurrentWindow().toggleMaximize()">□</button>
+    <button class="close" title="关闭" onclick="window.__TAURI__.window.getCurrentWindow().close()">✕</button>
+  </div>
   <div id="splash">
     <div class="logo"></div>
     <div class="status" id="status">正在启动 Agent 运行时…</div>
+    <div class="bar"><i></i></div>
+    <div class="bootlog" id="bootlog"></div>
     <div class="error" id="error"></div>
     <button id="retry" style="display:none" onclick="boot()">重试</button>
   </div>
@@ -55,6 +96,16 @@
       if (p.phase === 'install') {
         document.getElementById('status').textContent =
           '正在恢复已安装的插件（需要联网，可能需要几分钟）…'
+        return
+      }
+      if (p.phase === 'runtime-wait') {
+        document.getElementById('status').textContent =
+          `正在启动 Agent 运行时…（已等待 ${p.elapsed} 秒）`
+        return
+      }
+      if (p.phase === 'runtime-log') {
+        // dsh 日志行是真实进度：cordis 加载到哪个插件/报了什么错都在这。
+        document.getElementById('bootlog').textContent = p.line || ''
         return
       }
       const { done, total } = p

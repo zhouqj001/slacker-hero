@@ -28,4 +28,13 @@ vendor/deepseek-harness/
 .DS_Store
 docs/
 .tauri-tools-cache/
+.trae/
+.taste-skill/
+
+# ---- 本地调试残留 (严禁入库) ----
+.pnpm-cache/
+cookies.txt
+.smoke-body.json
+.smoke-cookies.txt
+shell/dsh-profile/slacker/.cache/
 # 有意提交: shell/src-tauri/Cargo.lock 与 shell/plugins/*/pnpm-lock.yaml

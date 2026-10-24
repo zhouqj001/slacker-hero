@@ -70,3 +70,8 @@ commands.allow = ["slacker_novel_float", "slacker_novel_resize"]
 identifier = "allow-slacker-theme"
 description = "Return the cached dsh root CSS variables for standalone windows to match the theme"
 commands.allow = ["slacker_theme_get"]
+
+[[permission]]
+identifier = "allow-slacker-media"
+description = "Native folder picker for the media workspace root (remote-origin invoke, same as the novel picker)"
+commands.allow = ["slacker_media_pick_dir"]

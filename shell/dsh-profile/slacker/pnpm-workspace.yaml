@@ -2,11 +2,22 @@ packages:
   - .
 
 nodeLinker: hoisted
-autoInstallPeers: false
+# Community plugins (better-sidebar / workbench / dshmarket) declare the dsh
+# runtime packages as peers; without auto-install their node half fails to
+# import ("failed to import" on boot). dsh-dream-skin's peer ranges
+# (>=0.1.0-rc.6 <0.3.0-0) can never match a prerelease under semver's
+# same-tuple rule, so those six are pinned via overrides below.
+autoInstallPeers: true
 # pnpm >= 10.13 reads overrides from this file (package.json "pnpm" field is
 # ignored since pnpm 11); must stay in sync with pnpm-lock.yaml's overrides.
 overrides:
-  '@deepseek-ai/dsh-tools': 0.1.5-rc.2
+  '@deepseek-ai/dsh-tools': 0.2.0-rc.2
+  '@deepseek-ai/dsh-client-locale': 0.2.0-rc.2
+  '@deepseek-ai/dsh-client-runtime': 0.2.0-rc.2
+  '@deepseek-ai/dsh-client-store': 0.2.0-rc.2
+  '@deepseek-ai/dsh-client-ui-settings': 0.2.0-rc.2
+  '@deepseek-ai/dsh-client-ui-settings-general': 0.2.0-rc.2
+  '@deepseek-ai/dsh-client-ui-theme': 0.2.0-rc.2
 # pnpm >= 10 blocks dependency build scripts by default (pnpm 11 fails the
 # install outright); node-pty needs its node-gyp build for the terminal.
 # pnpm 11: allowBuilds replaced onlyBuiltDependencies/ignoredBuiltDependencies.

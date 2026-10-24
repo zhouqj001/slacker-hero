@@ -147,7 +147,13 @@ function treeStats (root) {
     for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
       const p = path.join(dir, ent.name);
       if (ent.isDirectory()) walk(p);
-      else { files += 1; bytes += fs.statSync(p).size; }
+      else {
+        // Dead links (dangling symlink/junction, GC'd store entry) dereference
+        // to nothing, so they land nowhere after the copies below — skip them.
+        try { files += 1; bytes += fs.statSync(p).size; } catch (e) {
+          if (e.code !== 'ENOENT') throw e;
+        }
+      }
     }
   };
   walk(root);
@@ -191,7 +197,7 @@ function stagePluginTarballs () {
   const produced = [];
   let changed = false;
 
-  for (const p of ['novel', 'ui-slacker']) {
+  for (const p of ['novel', 'ui-slacker', 'media', 'writer']) {
     const pkgRoot = path.join(shellDir, 'plugins', p);
     const pkg = JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8'));
     const fileName = `${pkg.name.replace(/^@/, '').replace('/', '-')}-${pkg.version}.tgz`;
@@ -336,7 +342,7 @@ async function main () {
 
   // 1. Plugin bundles must exist — the profile install copies them in.
   //    (Also gates --tgz-only: the tarball IS the shipped bundle.)
-  for (const p of ['novel', 'ui-slacker']) {
+  for (const p of ['novel', 'ui-slacker', 'media', 'writer']) {
     if (!fs.existsSync(path.join(shellDir, 'plugins', p, 'lib'))) {
       fail(`shell/plugins/${p}/lib missing — run \`npm run setup\` (plugin bundle) first`);
     }

@@ -44,20 +44,163 @@ struct BootInfo {
  * node_modules is gitignored — restore with `npm install` in that dir. */
 const DSH_BIN: &str = "vendor/dsh-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js";
 
+/** Forward one dsh boot log line to the splash page — the real progress
+ * signal (dsh logs every plugin/loader stage while cordis boots). */
+fn emit_boot_line(app: &tauri::AppHandle, line: &str) {
+    let shown: String = line.chars().take(110).collect();
+    let _ = app.emit(
+        "slacker:boot-progress",
+        serde_json::json!({ "phase": "runtime-log", "line": shown }),
+    );
+}
+
 /** Wait until a local TCP port accepts a connection. */
-fn wait_port(host: &str, port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+fn wait_port(host: &str, port: u16, timeout: Duration, mut on_wait: impl FnMut(u64)) -> bool {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut next_tick = Duration::from_secs(1);
     while Instant::now() < deadline {
         if TcpStream::connect((host, port)).is_ok() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(250));
+        // 心跳：每满 1 秒回调一次已等待秒数，让启动页不至于像卡死。
+        let elapsed = start.elapsed();
+        if elapsed >= next_tick {
+            on_wait(elapsed.as_secs());
+            next_tick += Duration::from_secs(1);
+        }
     }
     false
 }
 
-/** Find a free TCP port by binding to port 0. */
+/* ── single instance: reuse a dsh web that is already serving this home ──
+ *
+ * Two shells sharing one DSH_HOME fight over the same profile, storages and
+ * browser profiles — a real source of "my settings changed by themselves"
+ * confusion. The pinned port doubles as the lock: the first instance holds
+ * 39115; a second one would fall back to a random port and both would run.
+ *
+ * Instead, remember the boot URL (which carries the session token) next to
+ * the home. On the next launch, probe it — if it answers, that dsh is still
+ * alive, so adopt its URL instead of spawning a rival process. Stale entries
+ * (dead process, port reused by something else) fail the probe and fall
+ * through to a normal spawn.
+ */
+
+/// Path of the remembered boot URL inside the dsh home. */
+fn boot_url_file(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("boot-url.txt")
+}
+
+/** Parse `http://127.0.0.1:<port>/?token=<token>` into (port, token). */
+fn parse_boot_url(url: &str) -> Option<(u16, String)> {
+    let rest = url.trim().strip_prefix("http://127.0.0.1:")?;
+    let (port, tail) = rest.split_once('/')?;
+    let token = tail
+        .split_once("token=")?
+        .1
+        .split(['&', '#'])
+        .next()?
+        .to_string();
+    Some((port.parse().ok()?, token))
+}
+
+/** Return the boot URL of an already-running dsh web for this home, if any. */
+fn probe_running_dsh(home: &std::path::Path) -> Option<String> {
+    let url = std::fs::read_to_string(boot_url_file(home)).ok()?;
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    let (port, token) = parse_boot_url(&url)?;
+    let req = format!("GET /?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let resp = http_exchange("127.0.0.1", port, &req)?;
+    // Any HTTP status line means something is serving there; require the token
+    // exchange to have been accepted so a stranger on the port is not adopted.
+    let ok = resp.starts_with("HTTP/1.1 30") || resp.starts_with("HTTP/1.1 20");
+    if ok {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+/** Remember the boot URL for the next launch (best effort). */
+fn remember_boot_url(home: &std::path::Path, url: &str) {
+    let _ = std::fs::write(boot_url_file(home), format!("{url}\n"));
+}
+
+/* ── dream-skin state guard ────────────────────────────────────────
+ *
+ * The skin plugin (dsh-dream-skin) persists in two places: the webview's
+ * localStorage and this host-side state file. localStorage is partitioned
+ * per webview origin, and the origin carries the dsh port — the port is now
+ * pinned, but WebKitGTK has been observed to keep no localStorage files at
+ * all, so the host file is the only durable copy we can rely on. When the
+ * page boots against a storage that lost its state it can end up writing an
+ * empty object back, which silently drops the user's skin.
+ *
+ * So: snapshot the file whenever it holds something, and put it back when a
+ * later boot finds it empty. Runs BEFORE dsh is spawned, so it can never
+ * race the plugin's own writes. To permanently clear the skin, delete the
+ * snapshot alongside the live file (a bare clear in the UI is undone).
+ */
+
+/// A state file "has content" when it parses as a JSON object with ≥1 key.
+fn json_object_nonempty(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(map)) => !map.is_empty(),
+        _ => false,
+    }
+}
+
+/// Snapshot a non-empty live state file, or restore the snapshot into an empty one.
+fn guard_skin_state(home: &std::path::Path) {
+    let live = home.join("dream-skin.json");
+    let snapshot = home.join("dream-skin.snapshot.json");
+
+    if json_object_nonempty(&live) {
+        let unchanged = std::fs::read_to_string(&snapshot).ok()
+            == std::fs::read_to_string(&live).ok();
+        if !unchanged {
+            let _ = std::fs::copy(&live, &snapshot);
+        }
+        return;
+    }
+
+    if json_object_nonempty(&snapshot) {
+        match std::fs::copy(&snapshot, &live) {
+            Ok(_) => println!("[slacker] skin state was empty; restored from snapshot"),
+            Err(e) => eprintln!("[slacker] skin snapshot restore failed: {e}"),
+        }
+    }
+}
+
+/// Pinned TCP port for the dsh web server — keeps the webview origin stable
+/// across boots so its per-origin localStorage survives a restart.
+const PREFERRED_PORT_DSH_WEB: u16 = 39115;
+
+/** Find a free TCP port for the dsh web server.
+ *
+ * The webview loads `http://127.0.0.1:<port>`, and both WebKitGTK and
+ * WebView2 partition localStorage **per origin** — protocol + host + port.
+ * A random port therefore hands the webview a brand-new, empty storage
+ * partition on every boot, so anything the page keeps in localStorage is
+ * gone next launch. Pinning the port keeps the origin (and that storage)
+ * stable. Falls back to an ephemeral port when the pinned one is taken —
+ * that happens when a second instance is already running.
+ *
+ * Returns PREFERRED_PORT_DSH_WEB by default. */
 fn free_port() -> u16 {
+    // Probe-then-drop: a brief race window is acceptable for a single
+    // desktop instance, and the fallback covers the loser of any race.
+    if std::net::TcpListener::bind(("127.0.0.1", PREFERRED_PORT_DSH_WEB)).is_ok() {
+        return PREFERRED_PORT_DSH_WEB;
+    }
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .and_then(|l| l.local_addr())
         .map(|a| a.port())
@@ -75,6 +218,111 @@ struct DshRuntime {
     /// PATH so dshmarket can install/upgrade plugins on machines with no
     /// global pnpm. None in dev, where the real pnpm is on PATH.
     pnpm_dir: Option<std::path::PathBuf>,
+}
+
+/**
+ * Copy the locally-hotfixed dsh packages from the runtime into the profile's
+ * node_modules, so both copies behave the same.
+ *
+ * dsh's `reconcileProfilePatches()` looks the root Include row up in a *module-level*
+ * WeakMap that only `mountRootInclude()` (same module instance) writes. The same dsh
+ * release ships as several copies on disk; only the boot copy is patched, so a caller
+ * resolving to another copy finds an empty map and throws. The settings/model write path
+ * (dsh-config-editor, dsh-settings) resolves through the profile tree — hence the sync.
+ *
+ * Runs on every boot because pnpm rewrites node_modules from the tarballs, which would
+ * silently revert the patch. A no-op when the copies already match.
+ */
+fn sync_dsh_hotfix(
+    repo_root: &std::path::Path,
+    profile_dir: &std::path::Path,
+) -> Result<(), String> {
+    // Only these carry local hotfixes; the rest of the tree is byte-identical.
+    // dsh-system-prompt: rc.2 lets per-agent prompt registrations land in the
+    // shared global layer, so the second same-name insert (e.g.
+    // "context:file-reference" from the next created agent) throws and fails
+    // every session creation.
+    // dsh-scope: the same package ships as two copies on disk (vendor runtime +
+    // profile node_modules), so the module loads twice. Its scope tag was a plain
+    // `Symbol("dsh.scope")` and its scope-parent map a module-local WeakMap, so
+    // scopes minted by one copy were invisible to the other: `scopeOf(ctx)` came
+    // back undefined, every tool/prompt registration fell into the shared global
+    // layer, and only the FIRST agent composed per process survived — every later
+    // session creation (UI or plugin) died with `already registered`. The hotfix
+    // shares the tag (Symbol.for) and both maps (globalThis), so either copy reads
+    // the same scope identity.
+    const PATCHED: [&str; 5] = ["dsh-app-boot", "dsh-config-editor", "dsh-settings", "dsh-system-prompt", "dsh-scope"];
+    let src_root = repo_root.join("vendor/dsh-runtime/node_modules/@deepseek-ai");
+    let dst_root = profile_dir.join("node_modules/@deepseek-ai");
+    if !dst_root.is_dir() {
+        return Ok(());
+    }
+    for pkg in PATCHED {
+        let rel = format!("{pkg}/lib/index.js");
+        let src = src_root.join(&rel);
+        let dst = dst_root.join(&rel);
+        if !src.is_file() || !dst.is_file() {
+            continue;
+        }
+        // Skip the write when already identical: touching the file would make
+        // dsh's HMR watcher reload the whole profile for nothing.
+        if std::fs::read(&src).ok() == std::fs::read(&dst).ok() {
+            continue;
+        }
+        std::fs::copy(&src, &dst).map_err(|e| format!("copy {rel}: {e}"))?;
+        println!("[slacker] synced dsh hotfix: {pkg}");
+    }
+    Ok(())
+}
+
+/**
+ * Dev-mode pnpm shim: a `pnpm` on PATH that runs the vendored pnpm.mjs with the
+ * system node.
+ *
+ * The vendored pnpm ships a POSIX shim that execs *its own* bundled node
+ * (`../node/<platform>/bin/node`). Only win32-x64 is bundled, so on Linux/macOS dev
+ * that shim exits with `exec: .../node/linux-x64/bin/node: not found`. dsh's plugin
+ * manager then reports `spawn pnpm ENOENT` on every in-app install/upgrade.
+ * Writing a tiny shim next to DSH_HOME sidesteps that: pnpm.mjs is plain node.
+ *
+ * @returns The shim directory, for prepending to the dsh child's PATH.
+ */
+fn dev_pnpm_shim(
+    repo_root: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let mjs = repo_root.join("shell/src-tauri/resources/runtime/pnpm/bin/pnpm.mjs");
+    if !mjs.exists() {
+        return Err(format!(
+            "vendored pnpm missing: {}",
+            mjs.display()
+        ));
+    }
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("create {}: {e}", bin.display()))?;
+    let mjs_text = mjs.display().to_string();
+    // POSIX: run through whatever node is on PATH. Windows: pnpm.cmd form so
+    // Command::new("pnpm") in the child resolves it.
+    #[cfg(target_os = "windows")]
+    let script = format!("@echo off\r\nnode \"{mjs_text}\" %*\r\n");
+    #[cfg(not(target_os = "windows"))]
+    let script = format!("#!/bin/sh\nexec node \"{mjs_text}\" \"$@\"\n");
+    let shim = if cfg!(target_os = "windows") { bin.join("pnpm.cmd") } else { bin.join("pnpm") };
+    std::fs::write(&shim, script).map_err(|e| format!("write {}: {e}", shim.display()))?;
+    #[cfg(not(target_os = "windows"))]
+    make_executable(&shim)?;
+    Ok(bin)
+}
+
+/** Mark a file executable (no-op on Windows, where ACLs differ). */
+#[cfg(not(target_os = "windows"))]
+fn make_executable(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .permissions();
+    perm.set_mode(perm.mode() | 0o755);
+    std::fs::set_permissions(path, perm).map_err(|e| format!("chmod {}: {e}", path.display()))
 }
 
 /** Vendored pnpm program: the shim inside pnpm_dir (shims are the only pnpm
@@ -122,7 +370,8 @@ fn pnpm_output(
  * whose store doesn't match that record (ERR_PNPM_UNEXPECTED_STORE) — a
  * shipped template would brick marketplace installs on any other machine.
  * Ask the vendored pnpm which store it would use here and rewrite the two
- * keys (the file is JSON despite the name). cwd = the home ROOT: same
+ * keys (JSON template format, or the YAML a fresh hoisted install writes —
+ * both handled). cwd = the home ROOT: same
  * volume as the profile (so the per-drive default store matches) but
  * outside node_modules, so the recorded foreign store can't poison the
  * answer.
@@ -153,13 +402,33 @@ fn calibrate_profile_store(
     }
     let raw = std::fs::read_to_string(&modules)
         .map_err(|e| format!("read {}: {e}", modules.display()))?;
-    let mut v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("parse {}: {e}", modules.display()))?;
-    v["storeDir"] = serde_json::json!(store);
-    v["virtualStoreDir"] =
-        serde_json::json!(profile.join("node_modules").join(".pnpm").display().to_string());
-    std::fs::write(&modules, format!("{}\n", serde_json::to_string_pretty(&v).unwrap()))
-        .map_err(|e| format!("write {}: {e}", modules.display()))?;
+    let virtual_store = profile.join("node_modules").join(".pnpm").display().to_string();
+    if raw.trim_start().starts_with('{') {
+        // JSON (which is also valid YAML — the historical template format).
+        let mut v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("parse {}: {e}", modules.display()))?;
+        v["storeDir"] = serde_json::json!(store);
+        v["virtualStoreDir"] = serde_json::json!(virtual_store);
+        std::fs::write(&modules, format!("{}\n", serde_json::to_string_pretty(&v).unwrap()))
+            .map_err(|e| format!("write {}: {e}", modules.display()))?;
+    } else {
+        // Real YAML (what a fresh hoisted install writes) — rewrite the two
+        // top-level keys line-wise. Single-quoted values: backslashes and the
+        // drive-letter colon survive unescaped.
+        let vstore = format!("'{}'", store.replace('\'', "''"));
+        let vvirt = format!("'{}'", virtual_store.replace('\'', "''"));
+        let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+        for line in lines.iter_mut() {
+            let t = line.trim_start();
+            if t.starts_with("storeDir:") {
+                *line = format!("storeDir: {vstore}");
+            } else if t.starts_with("virtualStoreDir:") {
+                *line = format!("virtualStoreDir: {vvirt}");
+            }
+        }
+        std::fs::write(&modules, format!("{}\n", lines.join("\n")))
+            .map_err(|e| format!("write {}: {e}", modules.display()))?;
+    }
     Ok(())
 }
 
@@ -584,10 +853,47 @@ fn dev_runtime() -> Result<DshRuntime, String> {
     std::fs::create_dir_all(&profile_dst).map_err(|e| format!("create profile dir: {e}"))?;
     for entry in std::fs::read_dir(&profile_src).map_err(|e| format!("read profile template: {e}"))? {
         let entry = entry.map_err(|e| e.to_string())?;
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            let name = entry.file_name();
-            std::fs::copy(entry.path(), profile_dst.join(&name))
-                .map_err(|e| format!("sync profile file {}: {e}", name.to_string_lossy()))?;
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let dst = profile_dst.join(&name);
+        // cordis.patch.yml is where dsh persists language / appearance / model
+        // selections at runtime — overwrite it and the user loses their setup on
+        // every dev boot. Merge instead (structure from template, runtime rows
+        // from home); every other template file stays a plain copy.
+        if name == "cordis.patch.yml" {
+            if let Ok(home_text) = std::fs::read_to_string(&dst) {
+                let tpl_text = std::fs::read_to_string(entry.path())
+                    .map_err(|e| format!("read profile template {}: {e}", name.to_string_lossy()))?;
+                let merged = merge_cordis_patch(&tpl_text, &home_text);
+                if merged != home_text {
+                    std::fs::write(&dst, merged)
+                        .map_err(|e| format!("merge profile {}: {e}", name.to_string_lossy()))?;
+                }
+                continue;
+            }
+        }
+        std::fs::copy(entry.path(), &dst)
+            .map_err(|e| format!("sync profile file {}: {e}", name.to_string_lossy()))?;
+    }
+    // The tgz-era package.json points the two in-repo plugins at
+    // file:./deps/*.tgz (staged by pack-runtime.cjs). pnpm resolves those
+    // relative to the package that declares them, so the synced home copy
+    // needs the deps dir too or its first pnpm install cannot resolve the
+    // graph (top-level file sync above skips subdirectories on purpose).
+    let deps_src = profile_src.join("deps");
+    if deps_src.is_dir() {
+        let deps_dst = profile_dst.join("deps");
+        std::fs::create_dir_all(&deps_dst)
+            .map_err(|e| format!("create profile deps dir: {e}"))?;
+        for entry in std::fs::read_dir(&deps_src).map_err(|e| format!("read profile deps: {e}"))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let name = entry.file_name();
+                std::fs::copy(entry.path(), deps_dst.join(&name))
+                    .map_err(|e| format!("sync profile dep {}: {e}", name.to_string_lossy()))?;
+            }
         }
     }
 
@@ -628,8 +934,20 @@ fn dev_runtime() -> Result<DshRuntime, String> {
                 .into(),
         );
     }
-    // Dev uses the machine's own pnpm (already on PATH) — nothing vendored.
-    Ok(DshRuntime { node: "node".into(), dsh_bin, dsh_cwd: repo_root, home, pnpm_dir: None })
+    // dsh 的本地 hotfix 必须每次启动都重新同步：任何 pnpm 操作（应用内插件安装、
+    // dshmarket 升级、pnpm add -w）都会从 tarball 重新解包，把补丁还原成上游版本。
+    // 还原后 dsh-config-editor / dsh-settings 会从 profile 依赖树解析到未打补丁的
+    // dsh-app-boot，它的模块级 WeakMap 没被 mountRootInclude 写过，于是设置页保存
+    // 模型配置时报 `profile reload requires the root Include entry`。
+    if let Err(e) = sync_dsh_hotfix(&repo_root, &profile_dst) {
+        println!("[slacker] dsh hotfix sync skipped: {e}");
+    }
+
+    // Dev has no vendored node (only win32-x64 is shipped) and no guarantee of a
+    // global pnpm, so the vendored pnpm shim — which execs its own node — cannot run.
+    // Build a shim that runs the vendored pnpm.mjs with whatever node is on PATH.
+    let pnpm_dir = dev_pnpm_shim(&repo_root, &home)?;
+    Ok(DshRuntime { node: "node".into(), dsh_bin, dsh_cwd: repo_root, home, pnpm_dir: Some(pnpm_dir) })
 }
 
 /**
@@ -645,6 +963,16 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
         Some(rt) => rt?,
         None => dev_runtime()?,
     };
+    // Before dsh touches it: keep the skin plugin's host-side state from
+    // silently reverting to an empty object across boots.
+    guard_skin_state(&rt.home);
+
+    // Single instance: a dsh web already serving THIS home wins; adopting its
+    // URL beats spawning a rival process onto the same profile + storages.
+    if let Some(existing) = probe_running_dsh(&rt.home) {
+        println!("[slacker] dsh web already running for this home; reusing it");
+        return Ok(existing);
+    }
 
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
@@ -668,23 +996,26 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     // Bundled node: prepend its dir to the child PATH so anything the dsh
     // runtime shells out to (`node`, file-archivers, …) resolves the pinned
     // binary rather than whatever happens to be installed on the machine.
-    if rt.node.is_absolute() {
-        if let Some(node_dir) = rt.node.parent() {
-            let path_env = std::env::var_os("PATH").unwrap_or_default();
-            let mut head = vec![node_dir.to_path_buf()];
-            // Vendored pnpm shim right after node: dshmarket's installs and
-            // upgrades resolve `pnpm` from here on machines without a global
-            // one — the previously fatal ERR_PNPM_UNEXPECTED_STORE case is
-            // gone (calibrated profile) and the binary itself now exists.
-            if let Some(pnpm_dir) = &rt.pnpm_dir {
-                head.push(pnpm_dir.clone());
-            }
-            let prepended = std::env::join_paths(
-                head.into_iter().chain(std::env::split_paths(&path_env)),
-            );
-            if let Ok(pre) = prepended {
-                cmd.env("PATH", pre);
-            }
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let mut head: Vec<std::path::PathBuf> = Vec::new();
+    // Bundled node: the dsh runtime shells out to `node`; use the pinned binary
+    // rather than whatever happens to be installed on the machine.
+    if let Some(node_dir) = rt.node.parent().filter(|_| rt.node.is_absolute()) {
+        head.push(node_dir.to_path_buf());
+    }
+    // pnpm next: dshmarket's install/upgrade shells out to `pnpm`; without this
+    // every in-app plugin install dies with `spawn pnpm ENOENT`. Independent of
+    // the node check above — in dev node is bare "node", and gating on it used
+    // to skip the pnpm injection entirely, which is what broke plugin installs.
+    if let Some(pnpm_dir) = &rt.pnpm_dir {
+        head.push(pnpm_dir.clone());
+    }
+    if !head.is_empty() {
+        let prepended = std::env::join_paths(
+            head.into_iter().chain(std::env::split_paths(&path_env)),
+        );
+        if let Ok(pre) = prepended {
+            cmd.env("PATH", pre);
         }
     }
     // Persist the exact launch shape next to the stderr log: when the child
@@ -737,13 +1068,10 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     let _ = std::fs::write(rt.home.join("dsh-web-launch.log"), launch_diag);
     // Keep stderr on disk: when dsh fails to boot (e.g. bundle resolution),
     // the port wait times out with no clue — this log holds the real error.
-    let stderr_log = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(rt.home.join("dsh-web-stderr.log"))
-        .map_err(|e| format!("open dsh stderr log: {e}"))?;
-    cmd.stderr(Stdio::from(stderr_log));
+    // Piped (not redirected): a reader thread both appends to the file and
+    // forwards lines to the splash page as live boot progress.
+    let stderr_log_path = rt.home.join("dsh-web-stderr.log");
+    cmd.stderr(Stdio::piped());
     // No stray console window for the node child (release, GUI subsystem).
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
@@ -754,9 +1082,21 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
     let url_arc = std::sync::Arc::new(Mutex::new(None::<String>));
     {
         let url_arc = url_arc.clone();
+        let app_fwd = app.clone();
+        // dsh's runtime logger writes to stdout: agent/session errors, bundle
+        // diagnostics, LLM failures. Dropping everything but the URL line made
+        // any post-boot failure (e.g. "new session failed") undiagnosable —
+        // mirror it to disk next to the stderr log.
+        let stdout_log_path = rt.home.join("dsh-web-stdout.log");
         std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut log = std::fs::File::create(&stdout_log_path).ok();
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
+                emit_boot_line(&app_fwd, &line);
+                if let Some(f) = log.as_mut() {
+                    let _ = writeln!(f, "{line}");
+                }
                 if let Some(rest) = line.strip_prefix("dsh web: ") {
                     // First whitespace token only: the line may end with a
                     // " (LAN: http://…)" suffix in newer dsh releases.
@@ -770,12 +1110,31 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
             }
         });
     }
+    if let Some(stderr) = child.stderr.take() {
+        let app_fwd = app.clone();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let mut log = std::fs::File::create(&stderr_log_path).ok();
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                emit_boot_line(&app_fwd, &line);
+                if let Some(f) = log.as_mut() {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        });
+    }
 
     // 180s on Windows (dsh-desktop parity): with zero first-boot unpacking
     // the wait is pure node/dsh boot, but cold module resolution under AV
     // scanning on slow disks can still take a minute+; never kill a healthy
     // boot early.
-    if !wait_port("127.0.0.1", port, Duration::from_secs(180)) {
+    if !wait_port("127.0.0.1", port, Duration::from_secs(180), |secs| {
+        let _ = app.emit(
+            "slacker:boot-progress",
+            serde_json::json!({ "phase": "runtime-wait", "elapsed": secs }),
+        );
+    }) {
         let _ = child.kill();
         return Err(format!(
             "dsh web did not listen on port {port} within 180s; real error: {}; launch diag: {}",
@@ -788,6 +1147,7 @@ fn spawn_dsh_web(app: &tauri::AppHandle) -> Result<String, String> {
         if let Some(u) = url_arc.lock().unwrap().clone() {
             *app.state::<ShellState>().url.lock().unwrap() = u.clone();
             *app.state::<ShellState>().child.lock().unwrap() = Some(child);
+            remember_boot_url(&rt.home, &u);
             println!("[slacker] boot url stored (len={})", u.len());
             selftest_browser_auth(&u, &rt.home);
             return Ok(u);
@@ -958,6 +1318,96 @@ fn shell_read_text(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))
 }
 
+/* ── cordis.patch.yml merge: keep dsh's runtime settings across dev boots ──
+ *
+ * dsh persists language / appearance / model selections INTO the profile's
+ * cordis.patch.yml (dsh-web-app README: "saves persist in
+ * $DSH_HOME/profiles/<profile>/cordis.patch.yml"). A dev boot used to copy the
+ * template over the home copy unconditionally, which wiped those rows on every
+ * start — the settings looked "lost" while everything else (credentials,
+ * storage domains) survived. The release path already guards this through
+ * restore_user_config(); dev needs the same courtesy, done properly:
+ *
+ *   - the `insert:` block is structural (which plugins mount) → always take the
+ *     template's, so plugin rows can never drift;
+ *   - every other top-level `- id:` row the home copy already has is KEPT, so
+ *     language / theme / model rows and hand edits survive;
+ *   - a template row the home copy lacks is APPENDED, so new seeds still land.
+ *
+ * Parsed line-wise rather than with a YAML crate: a patch file is a flat
+ * sequence of `- ` entries, which is all this needs to see.
+ */
+
+/** Split a patch file into (leading comment block, top-level entries). */
+fn split_patch(text: &str) -> (String, Vec<String>) {
+    let mut header = String::new();
+    let mut entries: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        if line.starts_with("- ") || line.trim_end() == "-" {
+            if !cur.is_empty() {
+                entries.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(line);
+            cur.push('\n');
+        } else if cur.is_empty() {
+            header.push_str(line);
+            header.push('\n');
+        } else {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    if !cur.is_empty() {
+        entries.push(cur);
+    }
+    (header, entries)
+}
+
+/** Stable identity of a patch entry: its `id:`, or the insert-block marker. */
+fn patch_entry_id(entry: &str) -> Option<String> {
+    for line in entry.lines() {
+        if line.starts_with("- insert:") {
+            return Some("#insert".to_string());
+        }
+        if let Some(rest) = line.strip_prefix("- id:") {
+            return Some(rest.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+        }
+    }
+    None
+}
+
+/** Merge the template patch into the home one, preserving runtime rows. */
+fn merge_cordis_patch(template: &str, home: &str) -> String {
+    let (_home_header, mut keep) = split_patch(home);
+    let (tpl_header, tpl) = split_patch(template);
+
+    // Structural plugin mounts: template wins, position stays first.
+    if let Some(inserts) = tpl.iter().find(|e| patch_entry_id(e).as_deref() == Some("#insert")) {
+        keep.retain(|e| patch_entry_id(e).as_deref() != Some("#insert"));
+        keep.insert(0, inserts.clone());
+    }
+    // Template rows the home copy lacks (new seeds) get appended.
+    for entry in &tpl {
+        let Some(id) = patch_entry_id(entry) else { continue };
+        if id == "#insert" {
+            continue;
+        }
+        if !keep.iter().any(|k| patch_entry_id(k).as_deref() == Some(id.as_str())) {
+            keep.push(entry.clone());
+        }
+    }
+
+    let mut out = tpl_header;
+    for entry in keep {
+        out.push_str(&entry);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /* ── slacker kv: the zone's persistence seam ─────────────────────
  * The dsh webview origin changes on every boot (fresh port + token),
  * so localStorage is dead there; all slacker state lands on disk via
@@ -1099,14 +1549,31 @@ fn slacker_novel_set_dir(app: tauri::AppHandle, dir: String) -> Result<(), Strin
 }
 
 /** 原生「选择文件夹」对话框；用户取消返回 null。
- * 默认定位到当前生效的小说下载目录（novels_dir），若无法解析则留给系统默认位置。 */
+ * 默认定位到当前生效的小说下载目录（novels_dir），若无法解析则留给系统默认位置。
+ *
+ * 注意：这里必须用 rfd 的异步 API + async 命令。同步版 rfd 会把对话框的 idle 回调投到
+ * 默认 GMainContext 上再自旋等待（utils.rs run_blocking）；而 Tauri 的同步命令是在主线程
+ * 内联执行的，主线程正是该 context 的属主 → idle 永远派发不到 → 死锁，界面整体冻结。
+ * 异步命令由 Tauri 投到 tokio 线程池，主线程的 GTK 主循环照常转，对话框正常弹出。 */
 #[tauri::command]
-fn slacker_novel_pick_dir(app: tauri::AppHandle) -> Option<String> {
-    let mut dlg = rfd::FileDialog::new().set_title("选择小说下载目录");
+async fn slacker_novel_pick_dir(app: tauri::AppHandle) -> Option<String> {
+    let mut dlg = rfd::AsyncFileDialog::new().set_title("选择小说下载目录");
     if let Ok(dir) = novels_dir(&app) {
         dlg = dlg.set_directory(dir);
     }
-    dlg.pick_folder().map(|p| p.to_string_lossy().into_owned())
+    dlg.pick_folder()
+        .await
+        .map(|h| h.path().to_string_lossy().into_owned())
+}
+
+/** 原生「选择文件夹」对话框（媒体工作文件夹）；用户取消返回 null。同上，必须走异步 API。 */
+#[tauri::command]
+async fn slacker_media_pick_dir() -> Option<String> {
+    rfd::AsyncFileDialog::new()
+        .set_title("选择媒体工作文件夹")
+        .pick_folder()
+        .await
+        .map(|h| h.path().to_string_lossy().into_owned())
 }
 
 /** Sanitize a shelf name into a safe file stem (no separators/reserved). */
@@ -2395,13 +2862,12 @@ pub fn run() {
     //   Ctrl+Shift+H —— 老板键，广播进隐身态（dsh 主应用共用同一组合同可并存）。
     //   Ctrl+Alt+←/→  —— 悬浮小窗专用翻页（穿透时窗口收不到键盘，需全局转发）。
     use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState};
-    let gs_plugin = match tauri_plugin_global_shortcut::Builder::new().with_shortcuts([
-        "ctrl+shift+h",
-        "ctrl+alt+arrowright",
-        "ctrl+alt+arrowleft",
-    ]) {
-        Ok(b) => b
-            .with_handler(|app, shortcut, event| {
+    // 逐键注册 + 单键失败跳过：workspace/桌面环境常占 Ctrl+Alt+←/→(如 GNOME
+    // 工作区切换)，with_shortcuts 的注册发生在 plugin init,一旦单键冲突整个
+    // 启动 panic(PluginInitialization)。改为 setup 阶段 register(),冲突键打
+    // 日志后继续,其余键(老板键等)照常生效。
+    let gs_plugin = tauri_plugin_global_shortcut::Builder::new()
+        .with_handler(|app, shortcut, event| {
                 if event.state != ShortcutState::Pressed {
                     return;
                 }
@@ -2415,12 +2881,7 @@ pub fn run() {
                     let _ = app.emit("slacker:boss-key", ());
                 }
             })
-            .build(),
-        Err(e) => {
-            eprintln!("[slacker] global shortcuts unavailable: {e}");
-            tauri_plugin_global_shortcut::Builder::new().build()
-        }
-    };
+            .build();
 
     tauri::Builder::default()
         .manage(ShellState {
@@ -2435,6 +2896,16 @@ pub fn run() {
         })
         .plugin(gs_plugin)
         .setup(|app| {
+            // 逐键注册全局快捷键(单键冲突跳过,不致杀进程):
+            //   Ctrl+Shift+H —— 老板键;Ctrl+Alt+←/→ —— 悬浮小窗翻页。
+            {
+                use tauri_plugin_global_shortcut::GlobalShortcutExt;
+                for sc in ["ctrl+shift+h", "ctrl+alt+arrowright", "ctrl+alt+arrowleft"] {
+                    if let Err(e) = app.global_shortcut().register(sc) {
+                        eprintln!("[slacker] hotkey '{sc}' unavailable: {e}");
+                    }
+                }
+            }
             // 主题桥：收 dsh 主窗广播的根 CSS 变量快照，供独立窗调色。
             // 事件由 dsh 主窗（client 的 theme-bridge）以 `slacker:theme` 发出。
             {
@@ -2481,6 +2952,8 @@ pub fn run() {
                 builder = builder.icon(icon.clone());
             }
             builder.build(app)?;
+            // 主窗标题栏走"无边框 + 网页自绘"（tauri.conf decorations:false），
+            // 标题/⋯/窗控由 ui-slacker 插件的 MainTitlebar 与启动页自绘。
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2498,6 +2971,7 @@ pub fn run() {
             slacker_novel_dir,
             slacker_novel_set_dir,
             slacker_novel_pick_dir,
+            slacker_media_pick_dir,
             slacker_stock_quotes,
             slacker_stock_trends,
             slacker_stock_search,

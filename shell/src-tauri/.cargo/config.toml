@@ -2,3 +2,10 @@
 # parallelism on this machine; the main app builds fine at reduced jobs.
 [build]
 jobs = 4
+
+# crates.io 直连超时，走 rsproxy 镜像
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"

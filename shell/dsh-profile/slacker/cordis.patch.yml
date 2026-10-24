@@ -12,3 +12,5 @@
       name: '@slacker/novel'
     - id: ui-slacker
       name: '@slacker/ui-slacker'
+    - id: media
+      name: '@slacker/media'
