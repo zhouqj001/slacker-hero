@@ -1445,6 +1445,9 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
           let skipped = 0
           let words = 0
           let failures = 0
+          // 连续失败熔断：单章故障只跳过不计致命，连败 3 章大概率系统性问题（quota/服务），才终止
+          const FAIL_STREAK_LIMIT = 3
+          let failStreak = 0
           try {
             const already = getBook(domain, book.id).outline.beats
               .filter(b => b.no <= target && b.status === 'finalized').length
@@ -1532,13 +1535,19 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 let out: GenerateChapterOutcome | null = null
                 for (let attempt = 0; attempt < 2; attempt++) {
                   if (request.signal.aborted) break
-                  out = await generateChapterCore({
-                    domain, ctrl: sessionCtrl(), send: () => {}, signal: request.signal,
-                    sessionId: chSess.sessionId, baseline: chSess.baseline, bookId: cur.id, no, refs: body.refs,
-                  })
-                  chSess = { sessionId: out.sessionId ?? undefined, baseline: out.baseline }
+                  try {
+                    out = await generateChapterCore({
+                      domain, ctrl: sessionCtrl(), send: () => {}, signal: request.signal,
+                      sessionId: chSess.sessionId, baseline: chSess.baseline, bookId: cur.id, no, refs: body.refs,
+                    })
+                  } catch (err) {
+                    // 网络抖动等瞬时异常按失败处理，不毁掉整卷任务
+                    if (request.signal.aborted) break
+                    out = null
+                  }
+                  if (out) chSess = { sessionId: out.sessionId ?? undefined, baseline: out.baseline }
                   if (request.signal.aborted) break
-                  if (out.status === 'ok') {
+                  if (out?.status === 'ok') {
                     // 质量闸：词数下限与章末钩子（仅首轮重试，末轮接受现状）
                     const floor = Math.max(200, Math.floor(cur.chapterWords * 0.55))
                     const short = out.quality.words < floor
@@ -1553,7 +1562,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                   }
                   if (attempt === 0) {
                     retried = attempt + 1
-                    send({ type: 'chapter/retry', no, reason: out.info.code })
+                    send({ type: 'chapter/retry', no, reason: out?.info.code ?? 'SERVER' })
                     await sleep(1500, request.signal)
                     continue
                   }
@@ -1561,11 +1570,19 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 if (request.signal.aborted) break
                 if (!out || out.status === 'error') {
                   failures++
-                  send({ type: 'error', code: out?.info.code ?? 'SERVER', message: `第 ${no} 章生成失败：${out?.info.zh ?? '未知错误'}`, fatal: true })
-                  break
+                  failStreak++
+                  const code = out?.info.code ?? 'SERVER'
+                  const zh = out?.info.zh ?? '未知错误'
+                  if (failStreak >= FAIL_STREAK_LIMIT) {
+                    send({ type: 'error', code, message: `连续 ${failStreak} 章失败（第 ${no} 章：${zh}），暂停任务；已完成的章已保存，稍后可继续`, fatal: true })
+                    break
+                  }
+                  send({ type: 'error', code, message: `第 ${no} 章生成失败：${zh}，跳过继续`, fatal: false })
+                  continue
                 }
                 generated++
                 words += out.quality.words
+                failStreak = 0
                 send({
                   type: 'chapter/done', no, words: out.quality.words,
                   hookOk: out.chapter.hookOk, issues: out.quality.issues.length,
@@ -1573,26 +1590,45 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 })
               }
               if (request.signal.aborted) break
-              // 定稿回写 + 记忆自动入册（单章失败不致命，继续下一章）
+              // 定稿回写 + 记忆自动入册（单章失败不致命，继续下一章；连败才熔断）
               send({ type: 'finalize/start', no })
-              const fout = await finalizeChapterCore({
-                domain, ctrl: sessionCtrl(), signal: request.signal, bookId: cur.id, no,
-              })
+              let fout: FinalizeChapterOutcome
+              try {
+                fout = await finalizeChapterCore({
+                  domain, ctrl: sessionCtrl(), signal: request.signal, bookId: cur.id, no,
+                })
+              } catch (err) {
+                if (request.signal.aborted) break
+                failures++
+                failStreak++
+                if (failStreak >= FAIL_STREAK_LIMIT) {
+                  send({ type: 'error', code: 'SERVER', message: `连续 ${failStreak} 章失败（第 ${no} 章定稿：${err instanceof Error ? err.message : String(err)}），暂停任务；已完成的章已保存，稍后可继续`, fatal: true })
+                  break
+                }
+                send({ type: 'finalize/fail', no, code: 'SERVER', message: err instanceof Error ? err.message : String(err) })
+                continue
+              }
               if (fout.status === 'fail') {
                 failures++
-                send({ type: 'finalize/fail', no, code: fout.info.code, message: fout.info.zh })
-              } else {
-                let applied = 0
-                if (autoMemory) {
-                  for (const item of fout.items) {
-                    try {
-                      await applyPendingRec(domain, item)
-                      applied++
-                    } catch { /* 单条失败不阻塞成书 */ }
-                  }
+                failStreak++
+                if (failStreak >= FAIL_STREAK_LIMIT) {
+                  send({ type: 'error', code: fout.info.code, message: `连续 ${failStreak} 章失败（第 ${no} 章定稿：${fout.info.zh}），暂停任务；已完成的章已保存，稍后可继续`, fatal: true })
+                  break
                 }
-                send({ type: 'finalize/done', no, applied, total: fout.items.length })
+                send({ type: 'finalize/fail', no, code: fout.info.code, message: fout.info.zh })
+                continue
               }
+              failStreak = 0
+              let applied = 0
+              if (autoMemory) {
+                for (const item of fout.items) {
+                  try {
+                    await applyPendingRec(domain, item)
+                    applied++
+                  } catch { /* 单条失败不阻塞成书 */ }
+                }
+              }
+              send({ type: 'finalize/done', no, applied, total: fout.items.length })
             }
             // 全部定稿 → 收官
             let finished = false
