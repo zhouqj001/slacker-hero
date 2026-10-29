@@ -657,27 +657,15 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
               <div className={s.row}>
                 <button
                   className={s.btnPrimary}
-                  disabled={gen != null || bookBusy || pendingBeatNo == null}
-                  onClick={() => pendingBeatNo != null && genChapter(pendingBeatNo)}
-                >写下一章</button>
-              </div>
-              <div className={s.row}>
-                <input
-                  className={`${s.input} ${s.numInput}`}
-                  type="number"
-                  min={1}
-                  max={300}
-                  value={bookTarget}
-                  disabled={bookBusy}
-                  onChange={e => {
-                    const n = Math.floor(Number(e.target.value))
-                    setBookTarget(Number.isFinite(n) ? Math.min(Math.max(n, 1), 300) : 100)
+                  disabled={gen != null || bookBusy}
+                  onClick={() => {
+                    if (pendingBeatNo == null) { showToast('没有待写的章纲，请到「大纲」页续排', true); return }
+                    genChapter(pendingBeatNo)
                   }}
-                />
-                <span className={s.tiny}>章</span>
+                >写下一章</button>
                 <span className={s.spacer} />
                 <button
-                  className={s.btnPrimary}
+                  className={s.btn}
                   disabled={gen != null || bookBusy}
                   onClick={() => setBookConfirm(true)}
                 >一键成书</button>
@@ -1143,11 +1131,32 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
         />
       )}
 
-      {/* 一键成书：开始前确认 */}
+      {/* 一键成书：开始前确认（目标章数在此填写） */}
       {bookConfirm && (
         <ConfirmModal
           title="一键成书"
-          message={`将连续写到第 ${bookTarget} 章：缺纲自动续排，逐章生成并质检重试，定稿回写后记忆自动确认入册。中途可随时停止，已完成的章会保留，下次可接着写。确定开始？`}
+          message={(
+            <>
+              <div className={s.confirmTargetRow}>
+                <span>连续写到</span>
+                <input
+                  className={`${s.input} ${s.numInput}`}
+                  type="number"
+                  min={1}
+                  max={300}
+                  value={bookTarget}
+                  onChange={e => {
+                    const n = Math.floor(Number(e.target.value))
+                    setBookTarget(Number.isFinite(n) ? Math.min(Math.max(n, 1), 300) : 100)
+                  }}
+                />
+                <span>章</span>
+              </div>
+              <div className={s.tiny}>
+                缺纲自动续排，逐章生成并质检重试，定稿回写后记忆自动确认入册。中途可随时停止，已完成的章会保留，下次可接着写。
+              </div>
+            </>
+          )}
           confirmText="开始成书"
           onConfirm={() => { setBookConfirm(false); startBookRun(bookTarget) }}
           onCancel={() => setBookConfirm(false)}

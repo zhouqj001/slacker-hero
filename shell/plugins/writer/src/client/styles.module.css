@@ -595,6 +595,7 @@
 }
 
 .numInput { width: 64px; text-align: center; }
+.confirmTargetRow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 
 /* ---------- 书架 ---------- */
 
