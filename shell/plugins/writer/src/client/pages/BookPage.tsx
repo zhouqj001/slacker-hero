@@ -60,6 +60,19 @@ interface BeatsRun {
   err: string | null
 }
 
+/** 一键成书批量任务的前端进度态。 */
+interface BookRunState {
+  target: number
+  current: number | null
+  generated: number
+  skipped: number
+  words: number
+  failures: number
+  message: string
+  phase: 'run' | 'done'
+  finished: boolean
+}
+
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
@@ -99,6 +112,12 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   const [confirmBusy, setConfirmBusy] = useState<string | null>(null)
   const memSess = useRef<{ sessionId?: string; baseline?: number }>({})
 
+  // ── 一键成书 ──
+  const [bookTarget, setBookTarget] = useState(100)
+  const [bookConfirm, setBookConfirm] = useState(false)
+  const [bookRun, setBookRun] = useState<BookRunState | null>(null)
+  const bookAbort = useRef<AbortController | null>(null)
+
   // ── 日志 ──
   const [logs, setLogs] = useState<WriterLog[]>([])
   const logsLoaded = useRef(false)
@@ -127,6 +146,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
     return () => {
       genAbort.current?.abort()
       beatsAbort.current?.abort()
+      bookAbort.current?.abort()
     }
   }, [reloadChapters, reloadDetail])
 
@@ -183,6 +203,10 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   }, [])
 
   const genChapter = useCallback((no: number) => {
+    if (bookRun?.phase === 'run') {
+      showToast('一键成书进行中，请先停止批量任务', true)
+      return
+    }
     if (!beatOf(no)) {
       showToast(`大纲里没有第 ${no} 章的章纲，请先到「大纲」页续排`, true)
       return
@@ -235,7 +259,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
     }, ctrl.signal).catch(err => {
       if (!ctrl.signal.aborted) setGen({ no, err: errMsg(err) })
     })
-  }, [applyChapterResult, beatOf, bookId, reloadChapters, reloadDetail, showToast])
+  }, [applyChapterResult, beatOf, bookId, bookRun, reloadChapters, reloadDetail, showToast])
 
   const stopGen = useCallback(() => {
     genAbort.current?.abort()
@@ -314,6 +338,117 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
       showToast(errMsg(err), true)
     }
   }, [bookId, reloadChapters, reloadDetail, selNo, showToast])
+
+  /** 一键成书：批量写到目标章数。后端自动续纲/质检重试/定稿/记忆入册，SSE 只报进度帧。 */
+  const startBookRun = useCallback((target: number) => {
+    if (gen) {
+      showToast('正在生成单章，请先完成或停止', true)
+      return
+    }
+    bookAbort.current?.abort()
+    const ctrl = new AbortController()
+    bookAbort.current = ctrl
+    setBookRun({ target, current: null, generated: 0, skipped: 0, words: 0, failures: 0, message: '正在准备…', phase: 'run', finished: false })
+    void postSse('/api/writer/generate/book', { bookId, target }, (frame: SseFrame) => {
+      const type = frame['type']
+      if (type === 'plan') {
+        const t = frameNum(frame, 'target') ?? 100
+        setBookRun(r => r ? { ...r, target: t, message: `目标 ${t} 章，已完成 ${frameNum(frame, 'already') ?? 0} 章，接着写…` } : r)
+        return false
+      }
+      if (type === 'beats/start') {
+        setBookRun(r => r ? { ...r, message: `章纲不够，正在续排约 ${frameNum(frame, 'count')} 章新章纲…` } : r)
+        return false
+      }
+      if (type === 'beats/done') {
+        setBookRun(r => r ? { ...r, message: `章纲已续排 ${frameNum(frame, 'added')} 章` } : r)
+        reloadDetail()
+        return false
+      }
+      if (type === 'chapter/skip') {
+        const no = frameNum(frame, 'no') ?? 0
+        setBookRun(r => r ? { ...r, current: no, skipped: r.skipped + 1, message: `第 ${no} 章已是定稿，跳过` } : r)
+        return false
+      }
+      if (type === 'chapter/start') {
+        const no = frameNum(frame, 'no') ?? 0
+        setBookRun(r => r ? { ...r, current: no, message: `正在写第 ${no} 章「${frameStr(frame, 'title')}」…` } : r)
+        return false
+      }
+      if (type === 'chapter/retry') {
+        const no = frameNum(frame, 'no')
+        const reason = frameStr(frame, 'reason')
+        const why = reason === 'WORDS_SHORT' ? '字数偏短' : reason === 'HOOK_WEAK' ? '章末钩子偏弱' : reason
+        setBookRun(r => r ? { ...r, message: `第 ${no} 章质检未过（${why}），自动重写…` } : r)
+        return false
+      }
+      if (type === 'chapter/done') {
+        const no = frameNum(frame, 'no') ?? 0
+        const w = frameNum(frame, 'words') ?? 0
+        const retried = frameNum(frame, 'retried') ?? 0
+        setBookRun(r => r ? {
+          ...r,
+          generated: r.generated + 1, words: r.words + w,
+          message: `第 ${no} 章初稿完成（${fmtWords(w)}${retried > 0 ? `，重写 ${retried} 次` : ''}）`,
+        } : r)
+        return false
+      }
+      if (type === 'finalize/start') {
+        setBookRun(r => r ? { ...r, message: `第 ${frameNum(frame, 'no')} 章定稿回写并自动入册…` } : r)
+        return false
+      }
+      if (type === 'finalize/fail') {
+        setBookRun(r => r ? {
+          ...r, failures: r.failures + 1,
+          message: `第 ${frameNum(frame, 'no')} 章定稿失败：${frameStr(frame, 'message')}，继续下一章`,
+        } : r)
+        return false
+      }
+      if (type === 'finalize/done') {
+        setBookRun(r => r ? {
+          ...r,
+          message: `第 ${frameNum(frame, 'no')} 章已定稿，记忆自动入册 ${frameNum(frame, 'applied')}/${frameNum(frame, 'total')} 条`,
+        } : r)
+        reloadDetail()
+        reloadChapters()
+        return false
+      }
+      if (type === 'error') {
+        setBookRun(r => r ? { ...r, message: frameStr(frame, 'message') || '批量生成出错' } : r)
+        return false
+      }
+      if (type === 'done') {
+        const aborted = frame['aborted'] === true
+        const finished = frame['finished'] === true
+        const generated = frameNum(frame, 'generated') ?? 0
+        const skipped = frameNum(frame, 'skipped') ?? 0
+        const failures = frameNum(frame, 'failures') ?? 0
+        setBookRun(r => r ? {
+          ...r,
+          generated, skipped, failures, words: frameNum(frame, 'words') ?? 0,
+          current: null, phase: 'done', finished,
+          message: finished
+            ? `全书完成！目标 ${frameNum(frame, 'target')} 章已全部定稿${failures > 0 ? `（${failures} 章定稿失败，可单独重试）` : ''}`
+            : aborted
+              ? `已停止：本轮生成 ${generated} 章、跳过 ${skipped} 章，进度已保存，可随时继续`
+              : `本轮结束：生成 ${generated} 章、跳过 ${skipped} 章${failures > 0 ? `，${failures} 章失败` : ''}`,
+        } : r)
+        reloadDetail()
+        reloadChapters()
+        return true
+      }
+      return false
+    }, ctrl.signal).catch(err => {
+      if (!ctrl.signal.aborted) {
+        setBookRun(r => r ? { ...r, phase: 'done', message: `连接中断：${errMsg(err)}` } : r)
+      }
+    })
+  }, [bookId, gen, reloadChapters, reloadDetail, showToast])
+
+  const stopBookRun = useCallback(() => {
+    bookAbort.current?.abort()
+    setBookRun(r => r ? { ...r, message: '正在停止…（等当前章节收尾）' } : r)
+  }, [])
 
   /** LLM 审稿：合并 AI 味 / 不确定密度 / 连续性，一次同步调用。 */
   const reviewChapter = useCallback(async () => {
@@ -461,6 +596,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   const d = detail as BookDetail
 
   const pendingBeatNo = book.outline.beats.find(b => b.status === 'pending')?.no ?? null
+  const bookBusy = bookRun != null && bookRun.phase === 'run'
 
   /** 待确认条目正文的纯文本渲染。 */
   const pendingBody = (p: PendingRec): string => {
@@ -521,10 +657,57 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
               <div className={s.row}>
                 <button
                   className={s.btnPrimary}
-                  disabled={gen != null || pendingBeatNo == null}
+                  disabled={gen != null || bookBusy || pendingBeatNo == null}
                   onClick={() => pendingBeatNo != null && genChapter(pendingBeatNo)}
                 >写下一章</button>
               </div>
+              <div className={s.row}>
+                <input
+                  className={`${s.input} ${s.numInput}`}
+                  type="number"
+                  min={1}
+                  max={300}
+                  value={bookTarget}
+                  disabled={bookBusy}
+                  onChange={e => {
+                    const n = Math.floor(Number(e.target.value))
+                    setBookTarget(Number.isFinite(n) ? Math.min(Math.max(n, 1), 300) : 100)
+                  }}
+                />
+                <span className={s.tiny}>章</span>
+                <span className={s.spacer} />
+                <button
+                  className={s.btnPrimary}
+                  disabled={gen != null || bookBusy}
+                  onClick={() => setBookConfirm(true)}
+                >一键成书</button>
+              </div>
+              {bookRun && (bookRun.phase === 'run' ? (
+                <div className={s.runBox}>
+                  <div className={s.row}>
+                    <span className={s.genDot} />
+                    <span className={`${s.grow} ${s.ellipsis}`}>{bookRun.message}</span>
+                  </div>
+                  <div className={s.tiny}>
+                    进度 第 {bookRun.current ?? '—'}/{bookRun.target} 章 · 生成 {bookRun.generated} · 跳过 {bookRun.skipped} · 累计 {fmtWords(bookRun.words)} · 失败 {bookRun.failures}
+                  </div>
+                  <div className={s.row}>
+                    <span className={s.spacer} />
+                    <button className={s.btnSm} onClick={stopBookRun}>停止</button>
+                  </div>
+                </div>
+              ) : (
+                <div className={s.runBox}>
+                  <div className={bookRun.failures > 0 ? s.errorText : undefined}>{bookRun.message}</div>
+                  <div className={s.tiny}>
+                    生成 {bookRun.generated} 章 · 跳过 {bookRun.skipped} 章 · 新增 {fmtWords(bookRun.words)} · 失败 {bookRun.failures} 章
+                  </div>
+                  <div className={s.row}>
+                    <span className={s.spacer} />
+                    <button className={s.btnSm} onClick={() => setBookRun(null)}>知道了</button>
+                  </div>
+                </div>
+              ))}
               <div className={`${s.chList} ${s.listGrow}`}>
                 {book.outline.beats.length === 0 && (
                   <div className={s.hint}>大纲还没有章纲，先到「大纲」页续排。</div>
@@ -594,7 +777,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                   <div className={s.btnBar}>
                     <button
                       className={s.btnPrimary}
-                      disabled={gen != null || !beatOf(selNo)}
+                      disabled={gen != null || bookBusy || !beatOf(selNo)}
                       onClick={() => genChapter(selNo)}
                     >{ch && ch.words > 0 ? '重新生成' : '生成本章'}</button>
                     <button className={s.btn} disabled={!dirty || saveBusy} onClick={() => void saveChapter()}>
@@ -603,16 +786,16 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                     <button className={s.btn} disabled={!ch || (ch.snapshots?.length ?? 0) === 0} onClick={restorePrev}>恢复上一版</button>
                     <button
                       className={s.btn}
-                      disabled={content.trim() === '' || finBusy || gen != null}
+                      disabled={content.trim() === '' || finBusy || gen != null || bookBusy}
                       onClick={() => void finalizeChapter()}
                     >{finBusy ? '回写中…' : '定稿回写'}</button>
                     <button
                       className={s.btn}
-                      disabled={content.trim() === '' || reviewBusy || gen != null || finBusy}
+                      disabled={content.trim() === '' || reviewBusy || gen != null || finBusy || bookBusy}
                       onClick={() => void reviewChapter()}
                     >{reviewBusy ? '审稿中…' : 'LLM 审稿'}</button>
                     {ch && ch.publishState === 'local' && (
-                      <button className={s.btnDanger} disabled={gen != null} onClick={() => setDelConfirm(true)}>删除本章</button>
+                      <button className={s.btnDanger} disabled={gen != null || bookBusy} onClick={() => setDelConfirm(true)}>删除本章</button>
                     )}
                     {ch && ch.summaryStale && <span className={`${s.tag} ${s.tagWarn}`}>摘要待更新，建议重新定稿回写</span>}
                   </div>
@@ -957,6 +1140,17 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
           danger
           onConfirm={() => void deleteChapter()}
           onCancel={() => setDelConfirm(false)}
+        />
+      )}
+
+      {/* 一键成书：开始前确认 */}
+      {bookConfirm && (
+        <ConfirmModal
+          title="一键成书"
+          message={`将连续写到第 ${bookTarget} 章：缺纲自动续排，逐章生成并质检重试，定稿回写后记忆自动确认入册。中途可随时停止，已完成的章会保留，下次可接着写。确定开始？`}
+          confirmText="开始成书"
+          onConfirm={() => { setBookConfirm(false); startBookRun(bookTarget) }}
+          onCancel={() => setBookConfirm(false)}
         />
       )}
 

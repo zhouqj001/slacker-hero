@@ -556,6 +556,311 @@ function flavorHitsOf(report: { issues: { code: string; message: string }[] }): 
 }
 
 // ------------------------------------------------------------------
+// 一键成书核心：单章生成 / 单章定稿 / 记忆入册（HTTP 路由与批量路由共用）
+// ------------------------------------------------------------------
+
+/** 一键成书运行中任务（bookId 集合；同一本书同时只允许一个批量任务）。 */
+const runningBookJobs = new Set<string>()
+
+/** 单章生成结果：ok = 成稿；error = LLM 硬失败/空响应（changed 表示已落部分稿）。 */
+type GenerateChapterOutcome =
+  | { status: 'ok'; chapter: ChapterRec; quality: ReturnType<typeof analyzeChapter>; sessionId: string | null; baseline: number }
+  | { status: 'error'; info: LlmErrorInfo; changed: boolean; sessionId: string | null; baseline: number }
+
+/**
+ * 单章生成核心（plan §4.2 装配 + 质量闸）：前情装配 → LLM 生成 → 剥钩子标记
+ * → 质检 → 落稿（快照旧稿）→ beat pending→drafted。generate/chapter 路由与
+ * 一键成书共用；send 供文本流转发，批量模式传 no-op（askSession 同款）。
+ */
+async function generateChapterCore(opts: {
+  domain: WriterDomain
+  ctrl: WriterSessionController
+  send: (data: object) => void
+  signal: AbortSignal
+  sessionId?: string
+  baseline?: number
+  bookId: string
+  no: number
+  refs?: string[]
+}): Promise<GenerateChapterOutcome> {
+  const { domain, ctrl, send, signal, no } = opts
+  const book = getBook(domain, opts.bookId)
+  const beat = book.outline.beats.find(b => b.no === no)
+  if (!beat) throw Object.assign(new Error(`大纲里没有第 ${no} 章的 beat，请先续排章纲`), { code: 'BEAT_MISSING' })
+  const chapters = domain.table('chapter')
+  let ch = getChapter(domain, book.id, no)
+  if (!ch) {
+    ch = blankChapter(book.id, no, beat.title)
+    await chapters.put(ch.id, ch)
+  }
+  // 前情装配：全局摘要 + 近 3 章摘要（升序）+ 上一章末 300 字
+  const prev = getChapter(domain, book.id, no - 1)
+  const recentSummaries = [...chapters.entries()].map(([, v]) => v)
+    .filter(c => c.bookId === book.id && c.no < no && !!c.summary?.trim())
+    .sort((a, b) => a.no - b.no)
+    .slice(-3)
+    .map(c => ({ no: c.no, summary: c.summary as string }))
+  const archetype = resolveArchetype(book.archetype ?? '')
+  // 显式引用：编辑器「关联设定」标记（只保留真实存在的设定名）
+  const knownNames = new Set(settingsOf(domain, book.id).map(s => s.name))
+  const explicitRefs = [...new Set(opts.refs ?? [])].filter(r => typeof r === 'string' && knownNames.has(r))
+  const prompt = buildChapterPrompts({
+    styleCard: book.styleCard || DEFAULT_STYLE_CARD,
+    archetype,
+    authorProfile: authorProfileOf(domain),
+    narrator: book.narrator ?? '',
+    chapterNo: no,
+    chapterTitle: ch.title || beat.title,
+    beatText: beat.beat,
+    hookText: beat.hook,
+    promise: beat.promise ?? '',
+    uncertainty: beat.uncertainty ?? '',
+    isCool: beat.isCool === true,
+    targetWords: book.chapterWords,
+    settings: settingsOf(domain, book.id),
+    explicitRefs,
+    memorySummary: book.memorySummary,
+    recentSummaries,
+    prevTail: prev?.content ? prev.content.slice(-300) : '',
+    dueForeshadows: dueForeshadowLines(domain, book.id, no),
+    goldenRule: goldenRuleFor(no),
+  })
+  const t0 = Date.now()
+  const result = await runSessionSse(ctrl, send, {
+    title: `第${no}章：${beat.title}`,
+    prompt,
+    signal,
+    sessionId: opts.sessionId,
+    baseline: opts.baseline,
+  })
+  const stripped = stripHookMark(result.text)
+  const report = analyzeChapter(stripped.content, {
+    chapterNo: no,
+    hookOk: stripped.hookOk,
+    fingerprint: archetype?.fingerprint,
+  })
+  const info = result.failure
+    ?? (stripped.content.trim() === '' ? resolveLlmError('EMPTY_RESPONSE') : undefined)
+  const changed = stripped.content.trim() !== '' && stripped.content !== ch.content
+  void writeLog(domain, {
+    bookId: book.id,
+    no,
+    stage: 'generate',
+    ok: !info,
+    ms: Date.now() - t0,
+    issueCount: report.issues.length,
+    err: info?.code,
+  })
+  if (changed) {
+    const next: ChapterRec = {
+      ...ch,
+      content: stripped.content,
+      words: report.words,
+      snapshots: pushSnapshot(ch, 'regenerate'),
+      summaryStale: ch.summary ? true : ch.summaryStale,
+      updatedAt: Date.now(),
+    }
+    if (!info) {
+      next.hookOk = stripped.hookOk
+      next.quality = report as unknown as Record<string, unknown>
+    }
+    await chapters.put(next.id, next)
+    ch = next
+  }
+  if (info) return { status: 'error', info, changed, sessionId: result.sessionId, baseline: result.baseline }
+  // beat pending → drafted（finalized/drafted 不回退）
+  if (beat.status === 'pending') {
+    await domain.table('book').update(book.id, b => ({
+      ...b,
+      outline: { ...b.outline, beats: b.outline.beats.map(x => x.no === no && x.status === 'pending' ? { ...x, status: 'drafted' } : x) },
+    }))
+  }
+  return { status: 'ok', chapter: ch, quality: report, sessionId: result.sessionId, baseline: result.baseline }
+}
+
+/** 单章定稿结果：ok = 提取成功并入 pending；fail = LLM 失败/解析失败（保留会话句柄可重试）。 */
+type FinalizeChapterOutcome =
+  | { status: 'ok'; items: PendingRec[]; extract: NonNullable<ReturnType<typeof parseFinalizeExtract>>; sessionId: string | null; baseline: number }
+  | { status: 'fail'; info: LlmErrorInfo; sessionId: string | null; baseline: number }
+
+/**
+ * 单章定稿核心：LLM 提取 → pending 待确认区（fail-closed，人工确认才入册）
+ * → beat → finalized。chapter/finalize 路由与一键成书共用。
+ */
+async function finalizeChapterCore(opts: {
+  domain: WriterDomain
+  ctrl: WriterSessionController
+  signal: AbortSignal
+  sessionId?: string
+  baseline?: number
+  bookId: string
+  no: number
+}): Promise<FinalizeChapterOutcome> {
+  const { domain, ctrl, signal, no } = opts
+  const book = getBook(domain, opts.bookId)
+  const ch = getChapter(domain, book.id, no)
+  if (!ch || ch.content.trim() === '') throw Object.assign(new Error('本章还没有正文，无法定稿'), { code: 'CHAPTER_EMPTY' })
+  const pendings = domain.table('pending')
+  const prompt = buildFinalizePrompts({
+    chapterNo: no,
+    chapterTitle: ch.title,
+    content: ch.content,
+    knownSettings: settingsOf(domain, book.id).map(s => s.name),
+  })
+  const t0 = Date.now()
+  const result = await askSession(ctrl, {
+    title: `定稿回写：第${no}章`,
+    prompt,
+    signal,
+    sessionId: opts.sessionId,
+    baseline: opts.baseline,
+  })
+  const extract = result.failure ? null : parseFinalizeExtract(result.text)
+  if (!extract) {
+    const info = result.failure ?? resolveLlmError('MALFORMED_RESPONSE')
+    void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: false, ms: Date.now() - t0, err: info.code })
+    return { status: 'fail', info, sessionId: result.sessionId, baseline: result.baseline }
+  }
+  // 重定稿：本章旧出处条目先失效（新条目确认后重新入册），再替换旧 pending
+  await markStaleBySource(domain, book.id, no)
+  for (const [pid, p] of [...pendings.entries()]) {
+    if (p.bookId === book.id && p.chapterNo === no) await pendings.delete(pid)
+  }
+  const now = Date.now()
+  const items: PendingRec[] = []
+  if (extract.summary.trim()) {
+    items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'summary', payload: { text: extract.summary }, createdAt: now })
+  }
+  for (const s of extract.characterStateChanges) {
+    items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'state', payload: { name: s.name, state: s.state, quote: s.quote }, createdAt: now })
+  }
+  for (const s of extract.newSettings) {
+    items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'setting', payload: { kind: s.kind, name: s.name, summary: s.summary, tags: s.tags, quote: s.quote }, createdAt: now })
+  }
+  for (const f of extract.newForeshadows) {
+    items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'foreshadow', payload: { desc: f.desc, suggestPayoffAt: f.suggestPayoffAt, quote: f.quote }, createdAt: now })
+  }
+  // 二期：知情更新（入册并入 knownBy）与场景时间锚（入册覆盖 chapter.timeline）
+  for (const k of extract.knowledgeUpdates) {
+    items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'knowledge', payload: { name: k.name, fact: k.fact }, createdAt: now })
+  }
+  if (extract.timeline.length > 0) {
+    items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'timeline', payload: { anchors: extract.timeline }, createdAt: now })
+  }
+  for (const item of items) await pendings.put(item.id, item)
+  void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: true, ms: Date.now() - t0 })
+  // beat → finalized
+  await domain.table('book').update(book.id, b => ({
+    ...b,
+    outline: { ...b.outline, beats: b.outline.beats.map(x => x.no === no ? { ...x, status: 'finalized' } : x) },
+  }))
+  return { status: 'ok', items, extract, sessionId: result.sessionId, baseline: result.baseline }
+}
+
+/** 单条待确认记忆入册（按 kind 落表；返回 skipped 原因，最后删除该条）。memory/confirm 路由与一键成书共用。 */
+async function applyPendingRec(domain: WriterDomain, pending: PendingRec): Promise<string[]> {
+  const skipped: string[] = []
+  const books = domain.table('book')
+  const settings = domain.table('setting')
+  const foreshadows = domain.table('foreshadow')
+  const chapters = domain.table('chapter')
+  if (pending.kind === 'summary') {
+    const text = typeof pending.payload['text'] === 'string' ? pending.payload['text'] : ''
+    if (text) {
+      await books.update(pending.bookId, b => ({ ...b, memorySummary: text, updatedAt: Date.now() }))
+    } else {
+      skipped.push('摘要内容为空，跳过')
+    }
+  } else if (pending.kind === 'state') {
+    const name = String(pending.payload['name'] ?? '')
+    const state = String(pending.payload['state'] ?? '')
+    const hit = [...settings.entries()].find(([, s]) => s.bookId === pending.bookId && s.name === name)
+    if (hit) {
+      const [sid, srec] = hit
+      // 出处入册：sourceChapterNo = 确认章号；quote 沿用提取摘录（旧 quote 兜底）
+      const quote = typeof pending.payload['quote'] === 'string' && pending.payload['quote']
+        ? pending.payload['quote'] : srec.quote
+      await settings.put(sid, { ...srec, state, sourceChapterNo: pending.chapterNo, quote, updatedAt: Date.now() })
+    } else {
+      skipped.push(`设定「${name}」不存在，跳过状态更新`)
+    }
+  } else if (pending.kind === 'setting') {
+    const name = String(pending.payload['name'] ?? '').trim()
+    if (!name) {
+      skipped.push('设定条目缺名字，跳过')
+    } else if ([...settings.entries()].some(([, s]) => s.bookId === pending.bookId && s.name === name)) {
+      skipped.push(`设定「${name}」已存在，跳过`)
+    } else {
+      const sid = newId('st')
+      await settings.put(sid, {
+        id: sid,
+        bookId: pending.bookId,
+        kind: settingKind(String(pending.payload['kind'] ?? 'world')),
+        name,
+        summary: String(pending.payload['summary'] ?? ''),
+        tags: Array.isArray(pending.payload['tags']) ? pending.payload['tags'].filter((t): t is string => typeof t === 'string') : [],
+        sourceChapterNo: pending.chapterNo,
+        quote: typeof pending.payload['quote'] === 'string' && pending.payload['quote'] ? pending.payload['quote'] : undefined,
+        updatedAt: Date.now(),
+      })
+    }
+  } else if (pending.kind === 'foreshadow') {
+    const desc = String(pending.payload['desc'] ?? '').trim()
+    if (!desc) {
+      skipped.push('伏笔描述为空，跳过')
+    } else {
+      const fid = newId('fs')
+      await foreshadows.put(fid, {
+        id: fid,
+        bookId: pending.bookId,
+        desc,
+        plantedAt: pending.chapterNo,
+        suggestPayoffAt: typeof pending.payload['suggestPayoffAt'] === 'number' ? pending.payload['suggestPayoffAt'] : undefined,
+        sourceChapterNo: pending.chapterNo,
+        quote: typeof pending.payload['quote'] === 'string' && pending.payload['quote'] ? pending.payload['quote'] : undefined,
+        createdAt: Date.now(),
+      })
+    }
+  } else if (pending.kind === 'knowledge') {
+    // 知情更新：并入角色 knownBy（去重），审稿 KNOWLEDGE_LEAK 的边界依据
+    const name = String(pending.payload['name'] ?? '').trim()
+    const fact = String(pending.payload['fact'] ?? '').trim()
+    const hit = [...settings.entries()].find(([, s]) => s.bookId === pending.bookId && s.name === name)
+    if (!name || !fact) {
+      skipped.push('知情条目缺角色或事实，跳过')
+    } else if (!hit || hit[1].kind !== 'character') {
+      skipped.push(`角色「${name}」不存在，跳过知情更新`)
+    } else {
+      const [sid, srec] = hit
+      const knownBy = srec.knownBy ?? []
+      if (!knownBy.includes(fact)) knownBy.push(fact)
+      await settings.put(sid, { ...srec, knownBy, updatedAt: Date.now() })
+    }
+  } else if (pending.kind === 'timeline') {
+    // 场景时间锚：整章覆盖写 chapter.timeline（start/end 缺失的锚点丢弃）
+    const anchors = Array.isArray(pending.payload['anchors']) ? pending.payload['anchors'] : []
+    const clean = anchors
+      .map(a => a as Record<string, unknown>)
+      .filter(a => typeof a['start'] === 'string' && a['start'].trim() && typeof a['end'] === 'string' && a['end'].trim())
+      .map(a => ({
+        scene: typeof a['scene'] === 'string' && a['scene'].trim() ? a['scene'] as string : undefined,
+        start: a['start'] as string,
+        gap: typeof a['gap'] === 'string' ? a['gap'] : '',
+        duration: typeof a['duration'] === 'string' ? a['duration'] : '',
+        end: a['end'] as string,
+      }))
+    const ch = getChapter(domain, pending.bookId, pending.chapterNo)
+    if (!ch) {
+      skipped.push('章不存在，跳过时间锚')
+    } else {
+      await chapters.put(ch.id, { ...ch, timeline: clean, updatedAt: Date.now() })
+    }
+  }
+  await domain.table('pending').delete(pending.id)
+  return skipped
+}
+
+// ------------------------------------------------------------------
 // 路由表
 // ------------------------------------------------------------------
 
@@ -1080,45 +1385,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
       const book = getBook(domain, body.bookId)
       const no = body.no
       if (typeof no !== 'number' || !Number.isInteger(no) || no <= 0) return fail('INVALID_REQUEST', 'no 必填')
-      const beat = book.outline.beats.find(b => b.no === no)
-      if (!beat) return fail('BEAT_MISSING', `大纲里没有第 ${no} 章的 beat，请先续排章纲`)
-      let ch = getChapter(domain, book.id, no)
-      if (!ch) {
-        ch = blankChapter(book.id, no, beat.title)
-        await chapters.put(ch.id, ch)
-      }
-      // 前情装配：全局摘要 + 近 3 章摘要（升序）+ 上一章末 300 字
-      const prev = getChapter(domain, book.id, no - 1)
-      const recentSummaries = [...chapters.entries()].map(([, v]) => v)
-        .filter(c => c.bookId === book.id && c.no < no && !!c.summary?.trim())
-        .sort((a, b) => a.no - b.no)
-        .slice(-3)
-        .map(c => ({ no: c.no, summary: c.summary as string }))
-      const archetype = resolveArchetype(book.archetype ?? '')
-      // 显式引用：编辑器「关联设定」标记（只保留真实存在的设定名）
-      const knownNames = new Set(settingsOf(domain, book.id).map(s => s.name))
-      const explicitRefs = [...new Set(body.refs ?? [])].filter(r => typeof r === 'string' && knownNames.has(r))
-      const prompt = buildChapterPrompts({
-        styleCard: book.styleCard || DEFAULT_STYLE_CARD,
-        archetype,
-        authorProfile: authorProfileOf(domain),
-        narrator: book.narrator ?? '',
-        chapterNo: no,
-        chapterTitle: ch.title || beat.title,
-        beatText: beat.beat,
-        hookText: beat.hook,
-        promise: beat.promise ?? '',
-        uncertainty: beat.uncertainty ?? '',
-        isCool: beat.isCool === true,
-        targetWords: book.chapterWords,
-        settings: settingsOf(domain, book.id),
-        explicitRefs,
-        memorySummary: book.memorySummary,
-        recentSummaries,
-        prevTail: prev?.content ? prev.content.slice(-300) : '',
-        dueForeshadows: dueForeshadowLines(domain, book.id, no),
-        goldenRule: goldenRuleFor(no),
-      })
+      if (!book.outline.beats.some(b => b.no === no)) return fail('BEAT_MISSING', `大纲里没有第 ${no} 章的 beat，请先续排章纲`)
       const stream = new ReadableStream({
         async start(controller) {
           const enc = new TextEncoder()
@@ -1128,71 +1395,14 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
             try { controller.enqueue(enc.encode(sseEvent(data))) } catch { /* 流已断 */ }
           }
           try {
-            const t0 = Date.now()
-            const result = await runSessionSse(sessionCtrl(), send, {
-              title: `第${no}章：${beat.title}`,
-              prompt,
-              signal: request.signal,
-              sessionId: body.sessionId,
-              baseline: body.baseline,
+            const out = await generateChapterCore({
+              domain, ctrl: sessionCtrl(), send, signal: request.signal,
+              sessionId: body.sessionId, baseline: body.baseline, bookId: book.id, no, refs: body.refs,
             })
-            const stripped = stripHookMark(result.text)
-            const report = analyzeChapter(stripped.content, {
-              chapterNo: no,
-              hookOk: stripped.hookOk,
-              fingerprint: archetype?.fingerprint,
-            })
-            const info = result.failure
-              ?? (stripped.content.trim() === '' ? resolveLlmError('EMPTY_RESPONSE') : undefined)
-            const changed = stripped.content.trim() !== '' && stripped.content !== ch!.content
-            void writeLog(domain, {
-              bookId: book.id,
-              no,
-              stage: 'generate',
-              ok: !info,
-              ms: Date.now() - t0,
-              issueCount: report.issues.length,
-              err: info?.code,
-            })
-            if (changed) {
-              const next: ChapterRec = {
-                ...ch!,
-                content: stripped.content,
-                words: report.words,
-                snapshots: pushSnapshot(ch!, 'regenerate'),
-                summaryStale: ch!.summary ? true : ch!.summaryStale,
-                updatedAt: Date.now(),
-              }
-              if (!info) {
-                next.hookOk = stripped.hookOk
-                next.quality = report as unknown as Record<string, unknown>
-              }
-              await chapters.put(next.id, next)
-              ch = next
-            }
-            if (info) {
-              send({
-                type: 'error',
-                code: info.code,
-                message: info.zh,
-                action: info.action,
-                partial: changed,
-              })
+            if (out.status === 'error') {
+              send({ type: 'error', code: out.info.code, message: out.info.zh, action: out.info.action, partial: out.changed })
             } else {
-              // beat pending → drafted（finalized/drafted 不回退）
-              if (beat.status === 'pending') {
-                await books.update(book.id, b => ({
-                  ...b,
-                  outline: { ...b.outline, beats: b.outline.beats.map(x => x.no === no && x.status === 'pending' ? { ...x, status: 'drafted' } : x) },
-                }))
-              }
-              send({
-                type: 'done',
-                chapter: ch,
-                quality: report,
-                sessionId: result.sessionId,
-                baseline: result.baseline,
-              })
+              send({ type: 'done', chapter: out.chapter, quality: out.quality, sessionId: out.sessionId, baseline: out.baseline })
             }
           } catch (err) {
             const ext = err as { code?: unknown }
@@ -1210,6 +1420,217 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
       return sseResponse(stream)
     }),
 
+    // ---------------- 一键成书（批量）----------------
+
+    // 自动循环：续排章纲 → 逐章生成（词数/钩子不达标重试 1 次）→ 定稿回写
+    // → 记忆自动入册。SSE 只报进度（章内正文流不转发）；同一本书同时只允许
+    // 一个任务；中止请求即中断；已 finalized 的章直接跳过 → 天然断点续跑。
+    route('/api/writer/generate/book', ['POST'], async (request) => {
+      const body = await readJson<{ bookId?: string; target?: number; autoMemory?: boolean; refs?: string[] }>(request) ?? {}
+      const book = getBook(domain, body.bookId)
+      const target = Math.min(Math.max(Math.floor(body.target ?? 100), 1), 300)
+      const autoMemory = body.autoMemory !== false
+      if (runningBookJobs.has(book.id)) return fail('BOOK_RUNNING', '该书已有一键成书任务在运行，请等它结束或刷新页面')
+      runningBookJobs.add(book.id)
+      const stream = new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder()
+          let closed = false
+          const send = (data: object): void => {
+            if (closed) return
+            try { controller.enqueue(enc.encode(sseEvent(data))) } catch { /* 流已断 */ }
+          }
+          const ping = setInterval(() => send({ type: 'ping', ts: Date.now() }), 15_000)
+          let generated = 0
+          let skipped = 0
+          let words = 0
+          let failures = 0
+          try {
+            const already = getBook(domain, book.id).outline.beats
+              .filter(b => b.no <= target && b.status === 'finalized').length
+            send({ type: 'plan', target, already })
+            for (let no = 1; no <= target; no++) {
+              if (request.signal.aborted) break
+              // 每轮取新书态（续纲会改 outline）
+              let cur = getBook(domain, book.id)
+              let beat = cur.outline.beats.find(b => b.no === no)
+              // 缺纲：自动续排（复用 outline/more 的 prompt 与 appendBeats 合并语义）
+              if (!beat) {
+                const maxNo = cur.outline.beats.reduce((m, b) => Math.max(m, b.no), 0)
+                const count = Math.min(Math.max(target - maxNo, 1), 30)
+                send({ type: 'beats/start', from: maxNo + 1, count })
+                const t0 = Date.now()
+                const result = await askSession(sessionCtrl(), {
+                  title: `续排章纲：${cur.name}`,
+                  prompt: buildMoreBeatsPrompts({
+                    bookName: cur.name,
+                    genre: cur.genre,
+                    logline: cur.outline.logline,
+                    coreConflict: cur.outline.coreConflict,
+                    memorySummary: cur.memorySummary,
+                    recentBeats: cur.outline.beats.slice(-5)
+                      .map(b => `- 第${b.no}章《${b.title}》：${b.beat}${b.status !== 'pending' ? '（已成稿）' : ''}`),
+                    openForeshadows: openForeshadowLines(domain, cur.id),
+                    startNo: maxNo + 1,
+                    count,
+                  }),
+                  signal: request.signal,
+                })
+                const proposal = result.failure ? null : parseBeatsProposal(result.text, false)
+                if (!proposal || proposal.beats.length === 0) {
+                  if (request.signal.aborted) break
+                  const info = result.failure ?? resolveLlmError('MALFORMED_RESPONSE')
+                  void writeLog(domain, { bookId: cur.id, stage: 'beats', ok: false, ms: Date.now() - t0, err: info.code })
+                  send({ type: 'error', code: info.code, message: `续排章纲失败：${info.zh}`, fatal: true })
+                  break
+                }
+                void writeLog(domain, { bookId: cur.id, stage: 'beats', ok: true, ms: Date.now() - t0 })
+                const before = cur.outline.beats.length
+                await books.update(cur.id, bk => {
+                  const existing = new Set(bk.outline.beats.map(x => x.no))
+                  const addition = proposal.beats
+                    .filter(x => x && typeof x.no === 'number' && typeof x.beat === 'string' && !existing.has(x.no))
+                    .map(x => ({
+                      no: x.no,
+                      title: x.title?.trim() || `第${x.no}章`,
+                      beat: x.beat as string,
+                      hook: x.hook?.trim() || '章末留钩子',
+                      promise: x.promise?.trim() || undefined,
+                      uncertainty: x.uncertainty?.trim() || undefined,
+                      payoffOf: typeof x.payoffOf === 'number' && x.payoffOf > 0 ? Math.floor(x.payoffOf) : undefined,
+                      isCool: x.isCool === true,
+                      isClimax: x.isClimax === true,
+                      status: 'pending' as const,
+                    }))
+                  return {
+                    ...bk,
+                    outline: { ...bk.outline, beats: [...bk.outline.beats, ...addition].sort((a, y) => a.no - y.no) },
+                  }
+                })
+                cur = getBook(domain, book.id)
+                send({ type: 'beats/done', added: cur.outline.beats.length - before })
+                beat = cur.outline.beats.find(b => b.no === no)
+                if (!beat) {
+                  send({ type: 'error', code: 'BEATS_MISMATCH', message: `续纲后仍没有第 ${no} 章的 beat，停止`, fatal: true })
+                  break
+                }
+              }
+              // 已定稿 → 跳过（断点续跑）
+              if (beat.status === 'finalized') {
+                skipped++
+                send({ type: 'chapter/skip', no, index: no, target })
+                continue
+              }
+              // 已成稿且有正文（上次定稿失败）→ 不重写，直接补定稿
+              const existingCh = getChapter(domain, book.id, no)
+              const needGen = !(beat.status === 'drafted' && existingCh != null && existingCh.content.trim() !== '')
+              let retried = 0
+              if (needGen) {
+                send({ type: 'chapter/start', no, title: beat.title, index: no, target })
+                // 同章重试沿用会话（LLM 可见上一稿）；跨章新会话（prompt 自带前情装配）
+                let chSess: { sessionId?: string; baseline?: number } = {}
+                let out: GenerateChapterOutcome | null = null
+                for (let attempt = 0; attempt < 2; attempt++) {
+                  if (request.signal.aborted) break
+                  out = await generateChapterCore({
+                    domain, ctrl: sessionCtrl(), send: () => {}, signal: request.signal,
+                    sessionId: chSess.sessionId, baseline: chSess.baseline, bookId: cur.id, no, refs: body.refs,
+                  })
+                  chSess = { sessionId: out.sessionId ?? undefined, baseline: out.baseline }
+                  if (request.signal.aborted) break
+                  if (out.status === 'ok') {
+                    // 质量闸：词数下限与章末钩子（仅首轮重试，末轮接受现状）
+                    const floor = Math.max(200, Math.floor(cur.chapterWords * 0.55))
+                    const short = out.quality.words < floor
+                    const weakHook = out.chapter.hookOk === false
+                    if ((short || weakHook) && attempt === 0) {
+                      retried = attempt + 1
+                      send({ type: 'chapter/retry', no, reason: short ? 'WORDS_SHORT' : 'HOOK_WEAK' })
+                      await sleep(1500, request.signal)
+                      continue
+                    }
+                    break
+                  }
+                  if (attempt === 0) {
+                    retried = attempt + 1
+                    send({ type: 'chapter/retry', no, reason: out.info.code })
+                    await sleep(1500, request.signal)
+                    continue
+                  }
+                }
+                if (request.signal.aborted) break
+                if (!out || out.status === 'error') {
+                  failures++
+                  send({ type: 'error', code: out?.info.code ?? 'SERVER', message: `第 ${no} 章生成失败：${out?.info.zh ?? '未知错误'}`, fatal: true })
+                  break
+                }
+                generated++
+                words += out.quality.words
+                send({
+                  type: 'chapter/done', no, words: out.quality.words,
+                  hookOk: out.chapter.hookOk, issues: out.quality.issues.length,
+                  retried, index: no, target,
+                })
+              }
+              if (request.signal.aborted) break
+              // 定稿回写 + 记忆自动入册（单章失败不致命，继续下一章）
+              send({ type: 'finalize/start', no })
+              const fout = await finalizeChapterCore({
+                domain, ctrl: sessionCtrl(), signal: request.signal, bookId: cur.id, no,
+              })
+              if (fout.status === 'fail') {
+                failures++
+                send({ type: 'finalize/fail', no, code: fout.info.code, message: fout.info.zh })
+              } else {
+                let applied = 0
+                if (autoMemory) {
+                  for (const item of fout.items) {
+                    try {
+                      await applyPendingRec(domain, item)
+                      applied++
+                    } catch { /* 单条失败不阻塞成书 */ }
+                  }
+                }
+                send({ type: 'finalize/done', no, applied, total: fout.items.length })
+              }
+            }
+            // 全部定稿 → 收官
+            let finished = false
+            if (!request.signal.aborted) {
+              const fin = getBook(domain, book.id)
+              const inRange = fin.outline.beats.filter(b => b.no >= 1 && b.no <= target)
+              if (inRange.length >= target && inRange.every(b => b.status === 'finalized')) {
+                if (fin.status !== 'finished') {
+                  await books.update(book.id, b => ({ ...b, status: 'finished', updatedAt: Date.now() }))
+                }
+                finished = true
+              }
+            }
+            send({ type: 'done', target, generated, skipped, words, failures, aborted: request.signal.aborted, finished })
+          } catch (err) {
+            if (request.signal.aborted) {
+              send({ type: 'done', target, generated, skipped, words, failures, aborted: true, finished: false })
+            } else {
+              const ext = err as { code?: unknown }
+              send({
+                type: 'error',
+                code: typeof ext?.code === 'string' ? ext.code : 'SERVER',
+                message: err instanceof Error ? err.message : String(err),
+                fatal: true,
+              })
+              send({ type: 'done', target, generated, skipped, words, failures, aborted: false, finished: false })
+            }
+          } finally {
+            runningBookJobs.delete(book.id)
+            clearInterval(ping)
+            closed = true
+            controller.close()
+          }
+        },
+      })
+      return sseResponse(stream)
+    }),
+
     // 定稿回写（JSON 路由）：提取 → pending 待确认区（人工确认才入册，fail-closed）。
     // LLM 失败走 {ok:true,data:{fail,...}} 保留会话句柄，客户端可重试。
     route('/api/writer/chapter/finalize', ['POST'], async (request) => {
@@ -1219,62 +1640,16 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
       if (typeof no !== 'number' || !Number.isInteger(no) || no <= 0) return fail('INVALID_REQUEST', 'no 必填')
       const ch = getChapter(domain, book.id, no)
       if (!ch || ch.content.trim() === '') return fail('CHAPTER_EMPTY', '本章还没有正文，无法定稿')
-      const prompt = buildFinalizePrompts({
-        chapterNo: no,
-        chapterTitle: ch.title,
-        content: ch.content,
-        knownSettings: settingsOf(domain, book.id).map(s => s.name),
+      const out = await finalizeChapterCore({
+        domain, ctrl: sessionCtrl(), signal: request.signal,
+        sessionId: body.sessionId, baseline: body.baseline, bookId: book.id, no,
       })
-      const t0 = Date.now()
-      const result = await askSession(sessionCtrl(), {
-        title: `定稿回写：第${no}章`,
-        prompt,
-        signal: request.signal,
-        sessionId: body.sessionId,
-        baseline: body.baseline,
-      })
-      const extract = result.failure ? null : parseFinalizeExtract(result.text)
-      if (!extract) {
-        const info = result.failure ?? resolveLlmError('MALFORMED_RESPONSE')
-        void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: false, ms: Date.now() - t0, err: info.code })
-        return json({ ok: true, data: { fail: info, sessionId: result.sessionId, baseline: result.baseline } })
+      if (out.status === 'fail') {
+        return json({ ok: true, data: { fail: out.info, sessionId: out.sessionId, baseline: out.baseline } })
       }
-      // 重定稿：本章旧出处条目先失效（新条目确认后重新入册），再替换旧 pending
-      await markStaleBySource(domain, book.id, no)
-      for (const [pid, p] of [...pendings.entries()]) {
-        if (p.bookId === book.id && p.chapterNo === no) await pendings.delete(pid)
-      }
-      const now = Date.now()
-      const items: PendingRec[] = []
-      if (extract.summary.trim()) {
-        items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'summary', payload: { text: extract.summary }, createdAt: now })
-      }
-      for (const s of extract.characterStateChanges) {
-        items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'state', payload: { name: s.name, state: s.state, quote: s.quote }, createdAt: now })
-      }
-      for (const s of extract.newSettings) {
-        items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'setting', payload: { kind: s.kind, name: s.name, summary: s.summary, tags: s.tags, quote: s.quote }, createdAt: now })
-      }
-      for (const f of extract.newForeshadows) {
-        items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'foreshadow', payload: { desc: f.desc, suggestPayoffAt: f.suggestPayoffAt, quote: f.quote }, createdAt: now })
-      }
-      // 二期：知情更新（入册并入 knownBy）与场景时间锚（入册覆盖 chapter.timeline）
-      for (const k of extract.knowledgeUpdates) {
-        items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'knowledge', payload: { name: k.name, fact: k.fact }, createdAt: now })
-      }
-      if (extract.timeline.length > 0) {
-        items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'timeline', payload: { anchors: extract.timeline }, createdAt: now })
-      }
-      for (const item of items) await pendings.put(item.id, item)
-      void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: true, ms: Date.now() - t0 })
-      // beat → finalized
-      await books.update(book.id, b => ({
-        ...b,
-        outline: { ...b.outline, beats: b.outline.beats.map(x => x.no === no ? { ...x, status: 'finalized' } : x) },
-      }))
       return json({
         ok: true,
-        data: { pending: items, extract, sessionId: result.sessionId, baseline: result.baseline },
+        data: { pending: out.items, extract: out.extract, sessionId: out.sessionId, baseline: out.baseline },
       })
     }),
 
@@ -1288,100 +1663,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         await pendings.delete(pending.id)
         return json({ ok: true, data: { applied: null, skipped: [] } })
       }
-      const skipped: string[] = []
-      if (pending.kind === 'summary') {
-        const text = typeof pending.payload['text'] === 'string' ? pending.payload['text'] : ''
-        if (text) {
-          await books.update(pending.bookId, b => ({ ...b, memorySummary: text, updatedAt: Date.now() }))
-        } else {
-          skipped.push('摘要内容为空，跳过')
-        }
-      } else if (pending.kind === 'state') {
-        const name = String(pending.payload['name'] ?? '')
-        const state = String(pending.payload['state'] ?? '')
-        const hit = [...settings.entries()].find(([, s]) => s.bookId === pending.bookId && s.name === name)
-        if (hit) {
-          const [sid, srec] = hit
-          // 出处入册：sourceChapterNo = 确认章号；quote 沿用提取摘录（旧 quote 兜底）
-          const quote = typeof pending.payload['quote'] === 'string' && pending.payload['quote']
-            ? pending.payload['quote'] : srec.quote
-          await settings.put(sid, { ...srec, state, sourceChapterNo: pending.chapterNo, quote, updatedAt: Date.now() })
-        } else {
-          skipped.push(`设定「${name}」不存在，跳过状态更新`)
-        }
-      } else if (pending.kind === 'setting') {
-        const name = String(pending.payload['name'] ?? '').trim()
-        if (!name) {
-          skipped.push('设定条目缺名字，跳过')
-        } else if ([...settings.entries()].some(([, s]) => s.bookId === pending.bookId && s.name === name)) {
-          skipped.push(`设定「${name}」已存在，跳过`)
-        } else {
-          const sid = newId('st')
-          await settings.put(sid, {
-            id: sid,
-            bookId: pending.bookId,
-            kind: settingKind(String(pending.payload['kind'] ?? 'world')),
-            name,
-            summary: String(pending.payload['summary'] ?? ''),
-            tags: Array.isArray(pending.payload['tags']) ? pending.payload['tags'].filter((t): t is string => typeof t === 'string') : [],
-            sourceChapterNo: pending.chapterNo,
-            quote: typeof pending.payload['quote'] === 'string' && pending.payload['quote'] ? pending.payload['quote'] : undefined,
-            updatedAt: Date.now(),
-          })
-        }
-      } else if (pending.kind === 'foreshadow') {
-        const desc = String(pending.payload['desc'] ?? '').trim()
-        if (!desc) {
-          skipped.push('伏笔描述为空，跳过')
-        } else {
-          const fid = newId('fs')
-          await foreshadows.put(fid, {
-            id: fid,
-            bookId: pending.bookId,
-            desc,
-            plantedAt: pending.chapterNo,
-            suggestPayoffAt: typeof pending.payload['suggestPayoffAt'] === 'number' ? pending.payload['suggestPayoffAt'] : undefined,
-            sourceChapterNo: pending.chapterNo,
-            quote: typeof pending.payload['quote'] === 'string' && pending.payload['quote'] ? pending.payload['quote'] : undefined,
-            createdAt: Date.now(),
-          })
-        }
-      } else if (pending.kind === 'knowledge') {
-        // 知情更新：并入角色 knownBy（去重），审稿 KNOWLEDGE_LEAK 的边界依据
-        const name = String(pending.payload['name'] ?? '').trim()
-        const fact = String(pending.payload['fact'] ?? '').trim()
-        const hit = [...settings.entries()].find(([, s]) => s.bookId === pending.bookId && s.name === name)
-        if (!name || !fact) {
-          skipped.push('知情条目缺角色或事实，跳过')
-        } else if (!hit || hit[1].kind !== 'character') {
-          skipped.push(`角色「${name}」不存在，跳过知情更新`)
-        } else {
-          const [sid, srec] = hit
-          const knownBy = srec.knownBy ?? []
-          if (!knownBy.includes(fact)) knownBy.push(fact)
-          await settings.put(sid, { ...srec, knownBy, updatedAt: Date.now() })
-        }
-      } else if (pending.kind === 'timeline') {
-        // 场景时间锚：整章覆盖写 chapter.timeline（start/end 缺失的锚点丢弃）
-        const anchors = Array.isArray(pending.payload['anchors']) ? pending.payload['anchors'] : []
-        const clean = anchors
-          .map(a => a as Record<string, unknown>)
-          .filter(a => typeof a['start'] === 'string' && a['start'].trim() && typeof a['end'] === 'string' && a['end'].trim())
-          .map(a => ({
-            scene: typeof a['scene'] === 'string' && a['scene'].trim() ? a['scene'] as string : undefined,
-            start: a['start'] as string,
-            gap: typeof a['gap'] === 'string' ? a['gap'] : '',
-            duration: typeof a['duration'] === 'string' ? a['duration'] : '',
-            end: a['end'] as string,
-          }))
-        const ch = getChapter(domain, pending.bookId, pending.chapterNo)
-        if (!ch) {
-          skipped.push('章不存在，跳过时间锚')
-        } else {
-          await chapters.put(ch.id, { ...ch, timeline: clean, updatedAt: Date.now() })
-        }
-      }
-      await pendings.delete(pending.id)
+      const skipped = await applyPendingRec(domain, pending)
       return json({ ok: true, data: { applied: pending.kind, skipped } })
     }),
 
