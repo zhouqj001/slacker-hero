@@ -12,6 +12,7 @@ import type {
   ChapterListItem,
   ChapterReview,
   PendingRec,
+  QualityGrade,
   QualityReport,
   SseFrame,
   WriterAccount,
@@ -31,6 +32,7 @@ import {
   frameNum,
   frameObj,
   frameStr,
+  getSse,
   postSse,
   s,
 } from '../common.ts'
@@ -53,6 +55,19 @@ const TAB_META: { id: Tab; label: string }[] = [
   { id: 'logs', label: '日志' },
 ]
 
+/** 质量分级展示文案（旧稿无 grade 时回退 passed）。 */
+const GRADE_LABEL: Record<QualityGrade, string> = {
+  gold: '金稿',
+  silver: '银稿',
+  bronze: '铜稿',
+  reject: '不合格',
+}
+
+/** 质检结论：优先 grade，旧稿回退 passed。 */
+function qualityAccepted(q: QualityReport): boolean {
+  return q.grade ? q.grade !== 'reject' : q.passed
+}
+
 /** 章纲续排/开新卷进行态。 */
 interface BeatsRun {
   kind: 'more' | 'volume'
@@ -68,9 +83,34 @@ interface BookRunState {
   skipped: number
   words: number
   failures: number
+  /** 质检不合格被跳过的章数（不计入 failures）。 */
+  rejected: number
   message: string
   phase: 'run' | 'done'
   finished: boolean
+}
+
+/** 按任务分模型（plan ③）三档。 */
+type LlmTaskKey = 'write' | 'review' | 'utility'
+
+const LLM_TASK_LABEL: Record<LlmTaskKey, string> = {
+  write: '正文',
+  review: '审稿',
+  utility: '辅助',
+}
+
+type LlmCfgDraft = Record<LlmTaskKey, { provider: string; model: string }>
+
+const EMPTY_LLM_CFG: LlmCfgDraft = {
+  write: { provider: '', model: '' },
+  review: { provider: '', model: '' },
+  utility: { provider: '', model: '' },
+}
+
+interface LlmConfigResp {
+  current?: Partial<Record<LlmTaskKey, { provider: string; model: string }>>
+  available?: boolean
+  providers?: { id: string; name?: string }[]
 }
 
 function errMsg(err: unknown): string {
@@ -113,6 +153,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   const memSess = useRef<{ sessionId?: string; baseline?: number }>({})
 
   // ── 一键成书 ──
+  const [bookFrom, setBookFrom] = useState(1)
   const [bookTarget, setBookTarget] = useState(100)
   const [bookConfirm, setBookConfirm] = useState(false)
   const [bookRun, setBookRun] = useState<BookRunState | null>(null)
@@ -121,6 +162,11 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   // ── 日志 ──
   const [logs, setLogs] = useState<WriterLog[]>([])
   const logsLoaded = useRef(false)
+
+  // ── 模型分工（plan ③；空 = 跟随默认模型）──
+  const [llmCfg, setLlmCfg] = useState<LlmCfgDraft>(EMPTY_LLM_CFG)
+  const [llmCfgExtra, setLlmCfgExtra] = useState<LlmConfigResp>({})
+  const [llmBusy, setLlmBusy] = useState(false)
 
   const book = detail?.book ?? null
   const account = accounts.find(a => a.id === book?.accountId) ?? null
@@ -161,6 +207,38 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
       .then(d => setLogs(Array.isArray(d.logs) ? d.logs : []))
       .catch(() => { logsLoaded.current = false })
   }, [bookId, tab])
+
+  useEffect(() => {
+    void apiGet<LlmConfigResp>('/api/writer/llm/config')
+      .then(d => {
+        setLlmCfgExtra(d)
+        setLlmCfg({
+          write: { provider: d.current?.write?.provider ?? '', model: d.current?.write?.model ?? '' },
+          review: { provider: d.current?.review?.provider ?? '', model: d.current?.review?.model ?? '' },
+          utility: { provider: d.current?.utility?.provider ?? '', model: d.current?.utility?.model ?? '' },
+        })
+      })
+      .catch(() => {})
+  }, [])
+
+  const saveLlmCfg = useCallback(async () => {
+    setLlmBusy(true)
+    try {
+      const body: Record<string, unknown> = {}
+      for (const task of ['write', 'review', 'utility'] as const) {
+        const p = llmCfg[task].provider.trim()
+        const m = llmCfg[task].model.trim()
+        body[task] = p !== '' && m !== '' ? { provider: p, model: m } : null
+      }
+      const d = await apiPost<LlmConfigResp>('/api/writer/llm/config', body)
+      setLlmCfgExtra(prev => ({ ...prev, current: d.current }))
+      showToast('模型分工已保存（新会话生效，未填 = 跟随默认模型）')
+    } catch (err) {
+      showToast(errMsg(err), true)
+    } finally {
+      setLlmBusy(false)
+    }
+  }, [llmCfg, showToast])
 
   const beatOf = useCallback((no: number) => book?.outline.beats.find(b => b.no === no) ?? null, [book])
   const chapterMetaOf = useCallback((no: number) => chapters.find(c => c.no === no) ?? null, [chapters])
@@ -239,7 +317,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
         const q = frameObj<QualityReport>(frame, 'quality') ?? null
         if (chapter) applyChapterResult(chapter, q)
         setGen(null)
-        showToast(`第 ${no} 章生成完成${q?.passed ? '，已通过质量闸' : '，请注意下方质检提示'}；确认无误后可「定稿回写」`)
+        showToast(`第 ${no} 章生成完成${q && qualityAccepted(q) ? `（${q.grade ? GRADE_LABEL[q.grade] : '已通过质量闸'}）` : '，请注意下方质检提示'}；确认无误后可「定稿回写」`)
         reloadChapters()
         reloadDetail()
         return true
@@ -340,7 +418,129 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   }, [bookId, reloadChapters, reloadDetail, selNo, showToast])
 
   /** 一键成书：批量写到目标章数。后端自动续纲/质检重试/定稿/记忆入册，SSE 只报进度帧。 */
-  const startBookRun = useCallback((target: number) => {
+  const handleBookFrame = useCallback((frame: SseFrame): boolean | void => {
+    const type = frame['type']
+    if (type === 'plan') {
+      const t = frameNum(frame, 'target') ?? 100
+      setBookRun(r => r ? { ...r, target: t, message: `目标 ${t} 章，已完成 ${frameNum(frame, 'already') ?? 0} 章，接着写…` } : r)
+      return false
+    }
+    if (type === 'beats/start') {
+      setBookRun(r => r ? { ...r, message: `章纲不够，正在续排约 ${frameNum(frame, 'count')} 章新章纲…` } : r)
+      return false
+    }
+    if (type === 'beats/done') {
+      setBookRun(r => r ? { ...r, message: `章纲已续排 ${frameNum(frame, 'added')} 章` } : r)
+      reloadDetail()
+      return false
+    }
+    if (type === 'chapter/skip') {
+      const no = frameNum(frame, 'no') ?? 0
+      const rejected = frameStr(frame, 'reason') === 'QUALITY_REJECT'
+      setBookRun(r => r ? {
+        ...r, current: no, skipped: r.skipped + 1,
+        message: rejected ? `第 ${no} 章质检不合格，已跳过` : `第 ${no} 章已是定稿，跳过`,
+      } : r)
+      return false
+    }
+    if (type === 'chapter/start') {
+      const no = frameNum(frame, 'no') ?? 0
+      setBookRun(r => r ? { ...r, current: no, message: `正在写第 ${no} 章「${frameStr(frame, 'title')}」…` } : r)
+      return false
+    }
+    if (type === 'chapter/retry') {
+      const no = frameNum(frame, 'no')
+      const reason = frameStr(frame, 'reason')
+      const grade = frameStr(frame, 'grade') as QualityGrade | null
+      const attempt = frameNum(frame, 'attempt')
+      const why = grade
+        ? (GRADE_LABEL[grade] ?? grade)
+        : reason === 'WORDS_SHORT' ? '字数偏短' : reason === 'HOOK_WEAK' ? '章末钩子偏弱' : reason
+      setBookRun(r => r ? {
+        ...r,
+        message: `第 ${no} 章质检未过（${why}）${attempt ? `，定向重写第 ${attempt} 次…` : '，自动重写…'}`,
+      } : r)
+      return false
+    }
+    if (type === 'chapter/accept') {
+      const no = frameNum(frame, 'no') ?? 0
+      const grade = frameStr(frame, 'grade') as QualityGrade | null
+      const n = frameNum(frame, 'acceptedAfterRewrites') ?? 0
+      setBookRun(r => r ? {
+        ...r,
+        message: `第 ${no} 章重写 ${n} 次后接受${grade ? `（${GRADE_LABEL[grade] ?? grade}）` : ''}`,
+      } : r)
+      return false
+    }
+    if (type === 'chapter/reject') {
+      const no = frameNum(frame, 'no') ?? 0
+      setBookRun(r => r ? {
+        ...r, rejected: r.rejected + 1,
+        message: `第 ${no} 章重写后仍不合格，跳过（可稍后单独重写）`,
+      } : r)
+      return false
+    }
+    if (type === 'chapter/done') {
+      const no = frameNum(frame, 'no') ?? 0
+      const w = frameNum(frame, 'words') ?? 0
+      const retried = frameNum(frame, 'retried') ?? 0
+      const grade = frameStr(frame, 'grade') as QualityGrade | null
+      setBookRun(r => r ? {
+        ...r,
+        generated: r.generated + 1, words: r.words + w,
+        message: `第 ${no} 章初稿完成${grade ? `（${GRADE_LABEL[grade] ?? grade}）` : ''}（${fmtWords(w)}${retried > 0 ? `，重写 ${retried} 次` : ''}）`,
+      } : r)
+      return false
+    }
+    if (type === 'finalize/start') {
+      setBookRun(r => r ? { ...r, message: `第 ${frameNum(frame, 'no')} 章定稿回写并自动入册…` } : r)
+      return false
+    }
+    if (type === 'finalize/fail') {
+      setBookRun(r => r ? {
+        ...r, failures: r.failures + 1,
+        message: `第 ${frameNum(frame, 'no')} 章定稿失败：${frameStr(frame, 'message')}，继续下一章`,
+      } : r)
+      return false
+    }
+    if (type === 'finalize/done') {
+      setBookRun(r => r ? {
+        ...r,
+        message: `第 ${frameNum(frame, 'no')} 章已定稿，记忆自动入册 ${frameNum(frame, 'applied')}/${frameNum(frame, 'total')} 条`,
+      } : r)
+      reloadDetail()
+      reloadChapters()
+      return false
+    }
+    if (type === 'error') {
+      setBookRun(r => r ? { ...r, message: frameStr(frame, 'message') || '批量生成出错' } : r)
+      return false
+    }
+    if (type === 'done') {
+      const aborted = frame['aborted'] === true
+      const finished = frame['finished'] === true
+      const generated = frameNum(frame, 'generated') ?? 0
+      const skipped = frameNum(frame, 'skipped') ?? 0
+      const failures = frameNum(frame, 'failures') ?? 0
+      const rejected = frameNum(frame, 'qualityFailures') ?? 0
+      setBookRun(r => r ? {
+        ...r,
+        generated, skipped, failures, rejected, words: frameNum(frame, 'words') ?? 0,
+        current: null, phase: 'done', finished,
+        message: finished
+          ? `全书完成！目标 ${frameNum(frame, 'target')} 章已全部定稿${failures > 0 ? `（${failures} 章定稿失败，可单独重试）` : ''}${rejected > 0 ? `（${rejected} 章质检跳过，可单独重写）` : ''}`
+          : aborted
+            ? `已停止：本轮生成 ${generated} 章、跳过 ${skipped} 章，进度已保存，可随时继续`
+            : `本轮结束：生成 ${generated} 章、跳过 ${skipped} 章${failures > 0 ? `，${failures} 章失败` : ''}${rejected > 0 ? `，${rejected} 章质检跳过` : ''}`,
+      } : r)
+      reloadDetail()
+      reloadChapters()
+      return true
+    }
+    return false
+  }, [reloadChapters, reloadDetail])
+
+  const startBookRun = useCallback((from: number, target: number) => {
     if (gen) {
       showToast('正在生成单章，请先完成或停止', true)
       return
@@ -348,107 +548,51 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
     bookAbort.current?.abort()
     const ctrl = new AbortController()
     bookAbort.current = ctrl
-    setBookRun({ target, current: null, generated: 0, skipped: 0, words: 0, failures: 0, message: '正在准备…', phase: 'run', finished: false })
-    void postSse('/api/writer/generate/book', { bookId, target }, (frame: SseFrame) => {
-      const type = frame['type']
-      if (type === 'plan') {
-        const t = frameNum(frame, 'target') ?? 100
-        setBookRun(r => r ? { ...r, target: t, message: `目标 ${t} 章，已完成 ${frameNum(frame, 'already') ?? 0} 章，接着写…` } : r)
-        return false
-      }
-      if (type === 'beats/start') {
-        setBookRun(r => r ? { ...r, message: `章纲不够，正在续排约 ${frameNum(frame, 'count')} 章新章纲…` } : r)
-        return false
-      }
-      if (type === 'beats/done') {
-        setBookRun(r => r ? { ...r, message: `章纲已续排 ${frameNum(frame, 'added')} 章` } : r)
-        reloadDetail()
-        return false
-      }
-      if (type === 'chapter/skip') {
-        const no = frameNum(frame, 'no') ?? 0
-        setBookRun(r => r ? { ...r, current: no, skipped: r.skipped + 1, message: `第 ${no} 章已是定稿，跳过` } : r)
-        return false
-      }
-      if (type === 'chapter/start') {
-        const no = frameNum(frame, 'no') ?? 0
-        setBookRun(r => r ? { ...r, current: no, message: `正在写第 ${no} 章「${frameStr(frame, 'title')}」…` } : r)
-        return false
-      }
-      if (type === 'chapter/retry') {
-        const no = frameNum(frame, 'no')
-        const reason = frameStr(frame, 'reason')
-        const why = reason === 'WORDS_SHORT' ? '字数偏短' : reason === 'HOOK_WEAK' ? '章末钩子偏弱' : reason
-        setBookRun(r => r ? { ...r, message: `第 ${no} 章质检未过（${why}），自动重写…` } : r)
-        return false
-      }
-      if (type === 'chapter/done') {
-        const no = frameNum(frame, 'no') ?? 0
-        const w = frameNum(frame, 'words') ?? 0
-        const retried = frameNum(frame, 'retried') ?? 0
-        setBookRun(r => r ? {
-          ...r,
-          generated: r.generated + 1, words: r.words + w,
-          message: `第 ${no} 章初稿完成（${fmtWords(w)}${retried > 0 ? `，重写 ${retried} 次` : ''}）`,
-        } : r)
-        return false
-      }
-      if (type === 'finalize/start') {
-        setBookRun(r => r ? { ...r, message: `第 ${frameNum(frame, 'no')} 章定稿回写并自动入册…` } : r)
-        return false
-      }
-      if (type === 'finalize/fail') {
-        setBookRun(r => r ? {
-          ...r, failures: r.failures + 1,
-          message: `第 ${frameNum(frame, 'no')} 章定稿失败：${frameStr(frame, 'message')}，继续下一章`,
-        } : r)
-        return false
-      }
-      if (type === 'finalize/done') {
-        setBookRun(r => r ? {
-          ...r,
-          message: `第 ${frameNum(frame, 'no')} 章已定稿，记忆自动入册 ${frameNum(frame, 'applied')}/${frameNum(frame, 'total')} 条`,
-        } : r)
-        reloadDetail()
-        reloadChapters()
-        return false
-      }
-      if (type === 'error') {
-        setBookRun(r => r ? { ...r, message: frameStr(frame, 'message') || '批量生成出错' } : r)
-        return false
-      }
-      if (type === 'done') {
-        const aborted = frame['aborted'] === true
-        const finished = frame['finished'] === true
-        const generated = frameNum(frame, 'generated') ?? 0
-        const skipped = frameNum(frame, 'skipped') ?? 0
-        const failures = frameNum(frame, 'failures') ?? 0
-        setBookRun(r => r ? {
-          ...r,
-          generated, skipped, failures, words: frameNum(frame, 'words') ?? 0,
-          current: null, phase: 'done', finished,
-          message: finished
-            ? `全书完成！目标 ${frameNum(frame, 'target')} 章已全部定稿${failures > 0 ? `（${failures} 章定稿失败，可单独重试）` : ''}`
-            : aborted
-              ? `已停止：本轮生成 ${generated} 章、跳过 ${skipped} 章，进度已保存，可随时继续`
-              : `本轮结束：生成 ${generated} 章、跳过 ${skipped} 章${failures > 0 ? `，${failures} 章失败` : ''}`,
-        } : r)
-        reloadDetail()
-        reloadChapters()
-        return true
-      }
-      return false
-    }, ctrl.signal).catch(err => {
+    setBookRun({ target, current: null, generated: 0, skipped: 0, words: 0, failures: 0, rejected: 0, message: '正在准备…', phase: 'run', finished: false })
+    // 任务在服务端常驻：断线/刷新只取消订阅，生成继续；重新进入页面会自动接回。
+    void postSse('/api/writer/generate/book', { bookId, target, from }, handleBookFrame, ctrl.signal).catch(err => {
       if (!ctrl.signal.aborted) {
         setBookRun(r => r ? { ...r, phase: 'done', message: `连接中断：${errMsg(err)}` } : r)
       }
     })
-  }, [bookId, gen, reloadChapters, reloadDetail, showToast])
+  }, [bookId, gen, handleBookFrame, showToast])
+
+  /** 接回正在运行的一键成书任务（回放已发生的进度帧）。 */
+  const attachBookRun = useCallback((target: number) => {
+    if (bookAbort.current && !bookAbort.current.signal.aborted) return
+    const ctrl = new AbortController()
+    bookAbort.current = ctrl
+    setBookRun(r => r ?? { target, current: null, generated: 0, skipped: 0, words: 0, failures: 0, rejected: 0, message: '正在接回后台任务…', phase: 'run', finished: false })
+    void getSse(`/api/writer/generate/book/follow?bookId=${encodeURIComponent(bookId)}`, handleBookFrame, ctrl.signal)
+      .then(() => {
+        // 订阅自然结束而没收到 done（如任务刚好已收尾）→ 不留死在「接回中」
+        if (ctrl.signal.aborted) return
+        setBookRun(r => r && r.phase === 'run' ? { ...r, phase: 'done', message: '后台任务已结束（可能本轮已收尾）' } : r)
+      })
+      .catch(err => {
+        if (!ctrl.signal.aborted) {
+          setBookRun(r => r ? { ...r, phase: 'done', message: `接回失败：${errMsg(err)}` } : r)
+        }
+      })
+  }, [bookId, handleBookFrame])
+
+  // 进入作品页时自动接回后台仍在跑的一键成书任务
+  useEffect(() => {
+    let cancelled = false
+    void apiGet<{ running: boolean; target?: number }>(`/api/writer/generate/book/status?bookId=${encodeURIComponent(bookId)}`)
+      .then(r => {
+        if (cancelled || !r.running) return
+        attachBookRun(r.target ?? 100)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [attachBookRun, bookId])
 
   const stopBookRun = useCallback(() => {
-    bookAbort.current?.abort()
     setBookRun(r => r ? { ...r, message: '正在停止…（等当前章节收尾）' } : r)
-  }, [])
+    // 终止服务端任务；本页订阅保持打开，收到 done{aborted:true} 后正常收尾
+    void apiPost('/api/writer/generate/book/stop', { bookId }).catch(err => showToast(errMsg(err), true))
+  }, [bookId, showToast])
 
   /** LLM 审稿：合并 AI 味 / 不确定密度 / 连续性，一次同步调用。 */
   const reviewChapter = useCallback(async () => {
@@ -677,7 +821,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                     <span className={`${s.grow} ${s.ellipsis}`}>{bookRun.message}</span>
                   </div>
                   <div className={s.tiny}>
-                    进度 第 {bookRun.current ?? '—'}/{bookRun.target} 章 · 生成 {bookRun.generated} · 跳过 {bookRun.skipped} · 累计 {fmtWords(bookRun.words)} · 失败 {bookRun.failures}
+                    进度 第 {bookRun.current ?? '—'}/{bookRun.target} 章 · 生成 {bookRun.generated} · 跳过 {bookRun.skipped} · 累计 {fmtWords(bookRun.words)} · 失败 {bookRun.failures}{bookRun.rejected > 0 ? ` · 质检跳过 ${bookRun.rejected}` : ''}
                   </div>
                   <div className={s.row}>
                     <span className={s.spacer} />
@@ -688,7 +832,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                 <div className={s.runBox}>
                   <div className={bookRun.failures > 0 ? s.errorText : undefined}>{bookRun.message}</div>
                   <div className={s.tiny}>
-                    生成 {bookRun.generated} 章 · 跳过 {bookRun.skipped} 章 · 新增 {fmtWords(bookRun.words)} · 失败 {bookRun.failures} 章
+                    生成 {bookRun.generated} 章 · 跳过 {bookRun.skipped} 章 · 新增 {fmtWords(bookRun.words)} · 失败 {bookRun.failures} 章{bookRun.rejected > 0 ? ` · 质检跳过 ${bookRun.rejected} 章` : ''}
                   </div>
                   <div className={s.row}>
                     <span className={s.spacer} />
@@ -790,11 +934,15 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                   {(quality || review) && (
                     <div className={s.infoPane}>
                       {quality && (
-                        <div className={`${s.qualityBox} ${quality.passed ? s.qualityPassed : s.qualityBlocked}`}>
+                        <div className={`${s.qualityBox} ${qualityAccepted(quality) ? s.qualityPassed : s.qualityBlocked}`}>
                           <div className={s.row}>
-                            <strong>{quality.passed ? '已通过质量闸' : '未通过质量闸'}</strong>
-                            <span className={s.muted}>{fmtWords(quality.words)} · {quality.paragraphCount} 段</span>
-                            {quality.passed && <span className={s.tiny}>可发布（到「发布」页操作）</span>}
+                            <strong>
+                              {quality.grade
+                                ? `${GRADE_LABEL[quality.grade]}${qualityAccepted(quality) ? '' : ' · 未通过质量闸'}`
+                                : (quality.passed ? '已通过质量闸' : '未通过质量闸')}
+                            </strong>
+                            <span className={s.muted}>{fmtWords(quality.words)} · {quality.paragraphCount} 段{typeof quality.score === 'number' ? ` · ${quality.score} 分` : ''}</span>
+                            {qualityAccepted(quality) && <span className={s.tiny}>可发布（到「发布」页操作）</span>}
                           </div>
                           {quality.issues.map((iss, i) => (
                             <div
@@ -1068,6 +1216,38 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
         {/* ── 日志 ── */}
         {tab === 'logs' && (
           <div className={s.col}>
+            <div className={s.card}>
+              <div className={s.row}>
+                <strong>模型分工</strong>
+                <span className={s.tiny}>未填 = 跟随默认模型；正文 / 审稿 / 辅助可各配 provider + model，新建会话生效。</span>
+                <span className={s.spacer} />
+                {llmCfgExtra.available
+                  ? <span className={`${s.tag} ${s.tagInfo}`}>可用路由：{(llmCfgExtra.providers ?? []).map(p => p.id).join(' / ') || '—'}</span>
+                  : <span className={s.tiny}>未接入模型目录，请手填</span>}
+                <button className={s.btnSm} disabled={llmBusy} onClick={() => void saveLlmCfg()}>
+                  {llmBusy ? '保存中…' : '保存'}
+                </button>
+              </div>
+              {(['write', 'review', 'utility'] as const).map(task => (
+                <div className={s.row} key={task}>
+                  <span className={s.muted} style={{ width: 40 }}>{LLM_TASK_LABEL[task]}</span>
+                  <input
+                    className={s.input}
+                    style={{ flex: 1 }}
+                    placeholder="provider（如 deepseek-official）"
+                    value={llmCfg[task].provider}
+                    onChange={e => setLlmCfg(c => ({ ...c, [task]: { ...c[task], provider: e.target.value } }))}
+                  />
+                  <input
+                    className={s.input}
+                    style={{ flex: 1 }}
+                    placeholder="model（如 deepseek-chat）"
+                    value={llmCfg[task].model}
+                    onChange={e => setLlmCfg(c => ({ ...c, [task]: { ...c[task], model: e.target.value } }))}
+                  />
+                </div>
+              ))}
+            </div>
             <div className={s.row}>
               <strong>创作日志</strong>
               <span className={s.tiny}>生成 / 续排 / 定稿 / 审稿 / 改稿的耗时与结果记录（最近 200 条）。</span>
@@ -1108,7 +1288,13 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                       </td>
                       <td>{(l.ms / 1000).toFixed(1)}s</td>
                       <td className={s.ellipsis} style={{ maxWidth: 360 }}>
-                        {l.err ? <span className={s.errorText}>{l.err}</span> : l.issueCount != null ? `${l.issueCount} 条问题` : '—'}
+                        {l.err
+                          ? <span className={s.errorText}>{l.err}</span>
+                          : [
+                            l.grade ? `等级 ${GRADE_LABEL[l.grade as QualityGrade] ?? l.grade}` : '',
+                            l.model ?? '',
+                            l.issueCount != null ? `${l.issueCount} 条问题` : '',
+                          ].filter(Boolean).join(' · ') || '—'}
                       </td>
                     </tr>
                   ))}
@@ -1138,7 +1324,21 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
           message={(
             <>
               <div className={s.confirmTargetRow}>
-                <span>连续写到</span>
+                <span>从第</span>
+                <input
+                  className={`${s.input} ${s.numInput}`}
+                  type="number"
+                  min={1}
+                  max={300}
+                  value={bookFrom}
+                  onChange={e => {
+                    const n = Math.floor(Number(e.target.value))
+                    const v = Number.isFinite(n) ? Math.min(Math.max(n, 1), 300) : 1
+                    setBookFrom(v)
+                    if (v > bookTarget) setBookTarget(v)
+                  }}
+                />
+                <span>章写到第</span>
                 <input
                   className={`${s.input} ${s.numInput}`}
                   type="number"
@@ -1147,18 +1347,20 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                   value={bookTarget}
                   onChange={e => {
                     const n = Math.floor(Number(e.target.value))
-                    setBookTarget(Number.isFinite(n) ? Math.min(Math.max(n, 1), 300) : 100)
+                    const v = Number.isFinite(n) ? Math.min(Math.max(n, 1), 300) : 100
+                    setBookTarget(v)
+                    if (v < bookFrom) setBookFrom(v)
                   }}
                 />
                 <span>章</span>
               </div>
               <div className={s.tiny}>
-                缺纲自动续排，逐章生成并质检重试，定稿回写后记忆自动确认入册。中途可随时停止，已完成的章会保留，下次可接着写。
+                区间内已定稿的章自动跳过，只写缺的部分；缺纲自动续排，逐章生成并质检重试，定稿回写后记忆自动入册。中途可随时停止，下次接着写。
               </div>
             </>
           )}
           confirmText="开始成书"
-          onConfirm={() => { setBookConfirm(false); startBookRun(bookTarget) }}
+          onConfirm={() => { setBookConfirm(false); startBookRun(bookFrom, bookTarget) }}
           onCancel={() => setBookConfirm(false)}
         />
       )}

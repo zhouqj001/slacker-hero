@@ -693,7 +693,10 @@ function flavorHitsOf(report: { issues: { code: string; message: string }[] }): 
 /** 一键成书任务（按 bookId 常驻：页面断线只取消订阅，不中断生成）。 */
 interface BookJob {
   bookId: string
+  /** 写到第几章（终点）。 */
   target: number
+  /** 从第几章开始（起点，默认 1）。 */
+  from: number
   autoMemory: boolean
   refs?: string[]
   signal: AbortController
@@ -1704,9 +1707,11 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
     // → 记忆自动入册。任务脱离页面常驻：断线只取消订阅，重进页面可接回进度；
     // 已 finalized 的章直接跳过 → 天然断点续跑。
     route('/api/writer/generate/book', ['POST'], async (request) => {
-      const body = await readJson<{ bookId?: string; target?: number; autoMemory?: boolean; refs?: string[] }>(request) ?? {}
+      const body = await readJson<{ bookId?: string; target?: number; from?: number; autoMemory?: boolean; refs?: string[] }>(request) ?? {}
       const book = getBook(domain, body.bookId)
       const target = Math.min(Math.max(Math.floor(body.target ?? 100), 1), 300)
+      // 区间起点：默认 1；越界收敛到 [1, target]（from > target 时收为 target）
+      const from = Math.min(Math.max(Math.floor(body.from ?? 1), 1), target)
       const autoMemory = body.autoMemory !== false
       // 同一本书已有任务在跑 → 直接接上（重复点击 / 刷新页面都幂等），不新开
       const current = bookJobs.get(book.id)
@@ -1715,7 +1720,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         job = current
       } else {
         job = {
-          bookId: book.id, target, autoMemory, refs: body.refs,
+          bookId: book.id, target, from, autoMemory, refs: body.refs,
           signal: new AbortController(), startedAt: Date.now(),
           frames: [], subscribers: new Set(), done: false,
         }
@@ -1738,9 +1743,9 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
           let failStreak = 0
           try {
             const already = getBook(domain, book.id).outline.beats
-              .filter(b => b.no <= target && b.status === 'finalized').length
-            send({ type: 'plan', target, already })
-            for (let no = 1; no <= target; no++) {
+              .filter(b => b.no >= from && b.no <= target && b.status === 'finalized').length
+            send({ type: 'plan', target, from, already })
+            for (let no = from; no <= target; no++) {
               if (request.signal.aborted) break
               // 每轮取新书态（续纲会改 outline）
               let cur = getBook(domain, book.id)
