@@ -45,6 +45,7 @@ import { IMAGE_PRESETS, imageAdapterStatus, imageGenRuntime } from './imagegen.t
 import { browserPool } from './platforms/browser.ts'
 import { resolveVideoAdapter, videoAdapterStatus } from './videogen.ts'
 import {
+  suggestWorkspaceRoot,
   workspaceRoot,
   setWorkspaceRoot,
   syncWorkspace,
@@ -121,7 +122,7 @@ function turnEndFailure(reason: unknown): LlmErrorInfo | undefined {
 async function askSession(
   ctrl: MediaSessionController,
   opts: { title: string; prompt: string; signal: AbortSignal; sessionId?: string; baseline?: number },
-): Promise<{ text: string; failure?: LlmErrorInfo; sessionId: string | null; baseline: number }> {
+): Promise<{ text: string; failure?: LlmErrorInfo; sessionId: string | null; baseline: number; accepted: boolean }> {
   const base = opts.baseline ?? 0
   let sessionId = opts.sessionId ?? null
   let accepted = false
@@ -183,7 +184,8 @@ async function askSession(
     }
   }
   // 每成功派一个 prompt 就等于该会话多了一个回合（mode:'queue' 排队执行）
-  return { text, failure, sessionId, baseline: base + (accepted ? 1 : 0) }
+  // accepted=false 表示 prompt 没被接受（典型：复用的会话在 dsh 重启后已不存在）——调用方据此降级重试
+  return { text, failure, sessionId, baseline: base + (accepted ? 1 : 0), accepted }
 }
 
 /** Shared prefix of every media route below the /api channel. */
@@ -591,6 +593,11 @@ export async function runPlanCore(
   if (!article) {
     return { ok: false, status: 404, code: 'ARTICLE_NOT_FOUND', message: `文章 ${plan.articleId} 不存在` }
   }
+  // 文章审核是唯一审核闸：文章未通过审批（生成中/写完待审/编辑中）不放行。
+  // 排期到点自动发也过这道闸——心智模型只有一句话：「文章通过审批 + 排期到点 = 自动发布」。
+  if (article.status !== 'approved') {
+    return { ok: false, status: 409, code: 'ARTICLE_NOT_APPROVED', message: '文章还没通过审批，先在内容库/动态流点「通过审批」' }
+  }
   const adapter = getAdapter(plan.platform)
   if (!adapter) {
     return { ok: false, status: 400, code: 'PLATFORM_UNSUPPORTED', message: `平台 ${plan.platform} 暂不支持` }
@@ -837,6 +844,14 @@ export async function runSchedulerOnce(
     if (account && account.status !== 'active') {
       skipped++
       results.push(`${plan.id}→跳过（账号「${account.displayName}」未登录）`)
+      continue
+    }
+    // 防呆 1.5：文章还没通过审批（生成中/写完待审/编辑中）就跳过，等过审后的下一轮——
+    // 审核闸只在文章层，这里不把未过审计划计入执行
+    const art = plan.articleId === null ? undefined : domain.table('article').get(plan.articleId)
+    if (art && art.status !== 'approved') {
+      skipped++
+      results.push(`${plan.id}→跳过（文章未通过审批）`)
       continue
     }
     // 防呆 3：同账号最小发布间隔
@@ -1557,7 +1572,21 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
       await domain.table('article').update(article.id, (current) => ({
         ...current, status, updatedAt: Date.now(),
       }))
-      return json({ ok: true, data: { id: article.id, status } })
+      // 连带同步计划：文章「通过审批」即内容定稿，名下待审计划一并放行
+      // （已到点被调度器立即执行、未来排期到点自动发）；「退回」则把已批
+      // 未发的计划撤回待审，防止退回后的旧稿仍被定时发布。其余状态不动。
+      let planSynced = 0
+      for (const [pid, p] of domain.table('plan').entries()) {
+        if (p.articleId !== article.id) continue
+        if (approved && p.state === 'pending-review') {
+          await domain.table('plan').update(pid, (cur) => ({ ...cur, state: 'approved' }))
+          planSynced++
+        } else if (!approved && p.state === 'approved') {
+          await domain.table('plan').update(pid, (cur) => ({ ...cur, state: 'pending-review' }))
+          planSynced++
+        }
+      }
+      return json({ ok: true, data: { id: article.id, status, planSynced } })
     },
   }
 
@@ -1752,6 +1781,31 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
           let failure: LlmErrorInfo | undefined
           let sessionId: string | undefined
 
+          // 写作全程每 10s 往流里发一帧心跳：写作/配图阶段可能几分钟没有任何帧，
+          // 静默的 SSE 会被传输中间层掐断（如 undici 默认 bodyTimeout 300s），前端就会
+          // 永远停在「生成中」。心跳既给链路保活，也是前端的存活信号。
+          // enqueue 抛错（流已关闭/客户端已断开）时自动停跳，不阻碍正常收尾。
+          let dead = false
+          const ping = setInterval(() => {
+            if (dead) return
+            try {
+              controller.enqueue(encoder.encode(sseEvent({ type: 'ping', at: Date.now() })))
+            } catch {
+              dead = true
+              clearInterval(ping)
+            }
+          }, 10_000)
+          // 发帧统一入口：客户端已断开时 enqueue 会抛，吞掉并停跳，保证收尾逻辑跑完
+          const send = (data: object) => {
+            try {
+              controller.enqueue(encoder.encode(sseEvent(data)))
+            } catch {
+              dead = true
+              clearInterval(ping)
+            }
+          }
+
+
           // fail-closed：sessionController 未注入时直接报错，不回落直连 LLM
           const ctrl = (ctx as unknown as { sessionController?: MediaSessionController }).sessionController
           if (!ctrl?.create) {
@@ -1764,7 +1818,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
               // 不指定 agentPreset，走 dsh 默认 preset（standard）
               const created = await ctrl.create({})
               sessionId = created.sessionId
-              controller.enqueue(encoder.encode(sseEvent({ type: 'session', sessionId })))
+              send({ type: 'session', sessionId })
               // 会话命名（best-effort）：让用户在会话列表一眼认出这篇稿子
               try {
                 await ctrl.rename({ sessionId, title: `媒体工作台 · ${article.title.slice(0, 24)}` })
@@ -1785,10 +1839,18 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
               }, request.signal)
 
               // 3. 跟随会话日志直到本回合结束；快照与实时帧走同一处理（兜底订阅竞速）
+              let progressChars = -1
               const handleEvent = (evType: string, evData: unknown): boolean => {
                 if (evType === 'assistant/message') {
                   const t = assistantTextFromEvent(evData)
-                  if (t.trim()) text = t
+                  if (t.trim()) {
+                    text = t
+                    // 进度帧：把当前字数推给前端（顺带持续保活链路），字数没变不发
+                    if (t.length !== progressChars) {
+                      progressChars = t.length
+                      send({ type: 'progress', chars: t.length })
+                    }
+                  }
                   return false
                 }
                 if (evType === 'turn/end') {
@@ -1827,32 +1889,9 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
           // 失败但有部分正文 → editing（可继续编辑）；失败且一字未出 → failed（生成失败，可重新生成）
           const status = failure ? (text.trim() ? 'editing' : 'failed') : 'generated'
 
-          // 自动配图：成功生成后依次产出封面 + 正文内联配图，失败不阻塞正文
+          // 正文先行落库：配图（封面+逐张内联图，串行生图可达数分钟）不再阻塞「已完成」的
+          // 感知——会话 turn/end 后正文立即入库、发 done 帧；配图转后台任务补齐后再覆盖落库
           let bodyMd = text
-          const imageWarns: string[] = []
-          if (!failure && text.trim()) {
-            try {
-              const cover = await illustrateArticle(domain, { ...article, bodyMd: text, status }, { forAgent: true })
-              if (cover.url) bodyMd = `![封面](${cover.url})\n\n${text}`
-              if (cover.blocked) imageWarns.push(`封面：${cover.blocked}`)
-              if (cover.error) imageWarns.push(`封面生成失败：${cover.error}`)
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err)
-              console.warn('[media/assets] 自动配图失败:', msg)
-              imageWarns.push(`封面生成失败：${msg}`)
-            }
-            try {
-              const out = await illustrateSpots(domain, articleId, bodyMd, { forAgent: true })
-              if (out.filled > 0 || out.failed > 0) bodyMd = out.bodyMd
-              if (out.blocked) imageWarns.push(`正文配图：${out.blocked}`)
-              for (const e of out.errors) imageWarns.push(`正文配图第 ${e.index} 张：${e.message}`)
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err)
-              console.warn('[media/assets] 正文配图失败:', msg)
-              imageWarns.push(`正文配图失败：${msg}`)
-            }
-          }
-
           await domain.table('article').update(articleId, (current) => ({
             ...current,
             bodyMd,
@@ -1860,20 +1899,58 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
             updatedAt: Date.now(),
           }))
 
-          // 工作文件夹：生成完成即落盘 <root>/<员工名>/<日期>-<标题>.md
+          // 工作文件夹：正文先落盘 <root>/<员工名>/<日期>-<标题>.md；配图完成后会再覆盖一次
           if (bodyMd.trim()) {
             wsTask(writeArticleFile(domain, { ...article, bodyMd, status }, persona.name))
           }
 
-          if (imageWarns.length > 0) {
-            controller.enqueue(encoder.encode(sseEvent({ type: 'notice', warnings: imageWarns })))
-          }
+          // 收尾：先停心跳再发最终帧，避免 done 与 ping 竞争乱序（配图告警在后台任务完成后落日志）
+          clearInterval(ping)
           if (failure) {
-            controller.enqueue(encoder.encode(
-              sseEvent({ type: 'error', code: failure.code, message: failure.zh, action: failure.action })
-            ))
+            send({ type: 'error', code: failure.code, message: failure.zh, action: failure.action })
           } else {
-            controller.enqueue(encoder.encode(sseEvent({ type: 'done', articleId, sessionId })))
+            send({ type: 'done', articleId, sessionId })
+          }
+
+          // 自动配图（后台）：依次产出封面 + 正文内联配图，失败逐条告警但不影响正文；
+          // 完成后覆盖落库与工作文件夹落盘，前端 25s 轮询即可拿到带图版本
+          if (!failure && text.trim()) {
+            void (async () => {
+              const warns: string[] = []
+              let rich = text
+              try {
+                const cover = await illustrateArticle(domain, { ...article, bodyMd: text, status }, { forAgent: true })
+                if (cover.url) rich = `![封面](${cover.url})\n\n${text}`
+                if (cover.blocked) warns.push(`封面：${cover.blocked}`)
+                if (cover.error) warns.push(`封面生成失败：${cover.error}`)
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err)
+                console.warn('[media/assets] 自动配图失败:', msg)
+                warns.push(`封面生成失败：${msg}`)
+              }
+              try {
+                const out = await illustrateSpots(domain, articleId, rich, { forAgent: true })
+                if (out.filled > 0 || out.failed > 0) rich = out.bodyMd
+                if (out.blocked) warns.push(`正文配图：${out.blocked}`)
+                for (const e of out.errors) warns.push(`正文配图第 ${e.index} 张：${e.message}`)
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err)
+                console.warn('[media/assets] 正文配图失败:', msg)
+                warns.push(`正文配图失败：${msg}`)
+              }
+              await domain.table('article').update(articleId, (current) => ({
+                ...current,
+                bodyMd: rich,
+                status: 'generated',
+                updatedAt: Date.now(),
+              }))
+              if (rich.trim()) {
+                wsTask(writeArticleFile(domain, { ...article, bodyMd: rich, status: 'generated' }, persona.name))
+              }
+              if (warns.length > 0) console.warn(`[media/assets] 《${article.title.slice(0, 20)}》配图告警:`, warns.join('；'))
+            })().catch(err => {
+              console.warn('[media/assets] 后台配图任务异常:', err instanceof Error ? err.message : String(err))
+            })
           }
           controller.close()
         },
@@ -1949,13 +2026,13 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
       return json({
         ok: true,
         data: list,
-        meta: { requireApproval: config.review.requireApproval },
       })
     },
   }
 
   /**
-   * POST /api/media/plan/save — 建/改计划。新建按审核总闸决定初始状态。
+   * POST /api/media/plan/save — 建/改计划。正式计划一律 approved（排期即生效，
+   * 发布还须文章通过审批——审核闸只在文章层）。
    *
    * `articleId` 可省略/为空 → 建「待排槽」（articleId=null，state 固定 'planned'）：
    * 由账号发布目标推算出来的档期占位，先占住时段、等用户选文章。
@@ -1973,6 +2050,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         platform?: string
         accountId?: string
         scheduledAt?: number
+        topic?: string | null
       }>(request)
       const existing = body?.id ? domain.table('plan').get(body.id) : undefined
       if (body?.id !== undefined && !existing) {
@@ -1986,6 +2064,11 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
       if (articleId !== null && !domain.table('article').get(articleId)) {
         return json({ ok: false, code: 'ARTICLE_NOT_FOUND', message: `文章 ${articleId} 不存在` }, 404)
       }
+      // topic：显式传空串/null = 清空选题；不传 = 沿用原值（新建则未定）
+      const rawTopic = body?.topic
+      const topic = rawTopic === undefined
+        ? existing?.topic
+        : (typeof rawTopic === 'string' && rawTopic.trim() !== '' ? rawTopic.trim() : undefined)
       const platform = typeof body?.platform === 'string' && body.platform.trim() !== ''
         ? body.platform.trim()
         : existing?.platform
@@ -2001,12 +2084,13 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
       }
       const id = body?.id ?? newId('plan')
       const wasSlot = existing !== undefined && existing.articleId === null
-      // 待排槽 → 正式计划（刚补上文章）：状态按审核总闸重算
+      // 计划不再单独审核（审核闸只在文章层）：正式计划一律 approved，排期即生效。
+      // 误发防护 = 文章审核（未过审文章到点被调度器跳过）+ 账号/限额/间隔防呆。
       const state = articleId === null
         ? 'planned' as const
         : wasSlot
-          ? (config.review.requireApproval ? 'pending-review' as const : 'approved' as const)
-          : (existing?.state ?? (config.review.requireApproval ? 'pending-review' as const : 'approved' as const))
+          ? 'approved' as const
+          : (existing?.state ?? 'approved' as const)
       const record = {
         id,
         articleId,
@@ -2015,6 +2099,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         scheduledAt: body?.scheduledAt ?? existing?.scheduledAt ?? Date.now(),
         state,
         reviewNote: wasSlot ? undefined : existing?.reviewNote,
+        topic,
         createdAt: existing?.createdAt ?? Date.now(),
       }
       await domain.table('plan').put(id, record)
@@ -2124,6 +2209,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
           id: p.id,
           when: whenLabel(p.scheduledAt),
           article: p.articleId === null ? null : (domain.table('article').get(p.articleId)?.title ?? null),
+          topic: p.topic ?? null,
         })),
       }
       // 走 dsh 会话（复用 dsh 默认模型与凭据），与文章生成同一条路线。
@@ -2138,19 +2224,33 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         '【输出要求】只输出一个 JSON 对象作为你的回复；',
         '不要写入文件、不要调用任何工具、不要输出执行计划或任务总结。',
       ].join('\n')
-      const reuseId = typeof body?.sessionId === 'string' && body.sessionId.trim() !== ''
-        ? body.sessionId.trim()
-        : undefined
-      const baseline = typeof body?.baseline === 'number' && Number.isInteger(body.baseline) && body.baseline >= 0
-        ? body.baseline
-        : undefined
-      const asked = await askSession(ctrl, {
+      // 会话句柄服务端持久化（存账号 planChat 槽）：关掉对话、刷新页面、换端进来都续用同一会话；
+      // 客户端传回的句柄仅作兜底（旧客户端 / 槽缺失时）。「新对话」reset 清掉槽后开新会话。
+      const stored = account.planChat
+      const reuseId = stored?.sessionId
+        ?? (typeof body?.sessionId === 'string' && body.sessionId.trim() !== '' ? body.sessionId.trim() : undefined)
+      const baseline = stored?.baseline
+        ?? (typeof body?.baseline === 'number' && Number.isInteger(body.baseline) && body.baseline >= 0 ? body.baseline : undefined)
+      const askOnce = (sessionId?: string) => askSession(ctrl, {
         title: `媒体工作台 · 发布规划 · ${account.displayName.slice(0, 16)}`,
         prompt: promptText,
         signal: request.signal,
-        sessionId: reuseId,
-        baseline,
+        sessionId,
+        baseline: sessionId !== undefined ? baseline : undefined,
       })
+      let asked = await askOnce(reuseId)
+      if (asked.failure !== undefined && reuseId !== undefined && !asked.accepted) {
+        // 持久化的会话可能已随 dsh 重启失效：prompt 没被接受时降级开新会话重试一次
+        asked = await askOnce(undefined)
+      }
+      // 句柄回存账号：下一轮无论从哪个端进来都续上（含失败轮——同一会话里排错重说）
+      if (asked.sessionId !== null) {
+        const sid = asked.sessionId
+        await domain.table('account').update(accountId, (cur) => ({
+          ...cur,
+          planChat: { sessionId: sid, baseline: asked.baseline },
+        }))
+      }
       // 会话句柄随回复带回：客户端下一轮传回来即续用同一会话（不再每问一句新开一个）。
       const turn = { sessionId: asked.sessionId, baseline: asked.baseline }
       // 大模型不通 / 回复看不懂：仍返回会话句柄（同一会话里排错重说），明确标 fail 不静默兜底
@@ -2178,7 +2278,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         })
       }
       if (out.proposal === null) {
-        return json({ ok: true, data: { reply: out.reply, proposal: null, ...turn } })
+        return json({ ok: true, data: { reply: out.reply, proposal: null, pillarSuggestions: out.pillarSuggestions, ...turn } })
       }
       const p = out.proposal
       const checked = validateProposal(domain, accountId, p)
@@ -2212,12 +2312,14 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         ok: true,
         data: {
           reply: out.reply ?? '这是调整后的整期提案，确认后写入日程。',
+          pillarSuggestions: out.pillarSuggestions,
           proposal: {
             period: p.period,
             periodLabel: periodStart(p.period).label,
             target: p.target,
             slots: p.slots,
             published: pub,
+            topics: p.topics,
             keep: checked.keep.map(x => ({ id: x.id, scheduledAt: x.scheduledAt, title: titleOf(x) })),
             remove: checked.remove.map(x => ({ id: x.id, scheduledAt: x.scheduledAt, title: titleOf(x) })),
             add: sp.slots,
@@ -2226,6 +2328,26 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
           ...turn,
         },
       })
+    },
+  }
+
+  /** POST /api/media/plan/chat/reset — 结束当前对话排期会话（服务端清句柄，下轮开新会话）。 */
+  const planChatReset: ConnectionFetchRoute = {
+    path: `${ROUTE_PREFIX}/plan/chat/reset`,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      const body = await readJson<{ accountId?: string }>(request)
+      const accountId = typeof body?.accountId === 'string' ? body.accountId.trim() : ''
+      if (accountId === '') return json({ ok: false, code: 'INVALID_REQUEST', message: 'accountId 必填' }, 400)
+      const account = domain.table('account').get(accountId)
+      if (!account) return json({ ok: false, code: 'ACCOUNT_NOT_FOUND', message: `账号 ${accountId} 不存在` }, 404)
+      await domain.table('account').update(accountId, (cur) => {
+        const next = { ...cur }
+        delete next.planChat
+        return next
+      })
+      return json({ ok: true, data: { cleared: true } })
     },
   }
 
@@ -2246,6 +2368,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         target?: number
         slots?: unknown
         removePlanIds?: unknown
+        topics?: unknown
       }>(request)
       const accountId = typeof body?.accountId === 'string' ? body.accountId.trim() : ''
       if (accountId === '') {
@@ -2293,11 +2416,19 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         taken,
       )
       const created: number[] = []
+      // 对话提案带的选题清单：按发布顺序逐条配到新增档期上（可少给，多出的忽略）
+      const topics = Array.isArray(body?.topics)
+        ? body.topics.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim())
+        : []
+      let topicIndex = 0
       for (const ts of sp.slots) {
         const id = newId('plan')
+        const topic = topics[topicIndex]
+        if (topic !== undefined) topicIndex += 1
         await domain.table('plan').put(id, {
           id, articleId: null, platform: account.platform, accountId,
           scheduledAt: ts, state: 'planned' as const,
+          ...(topic !== undefined ? { topic } : {}),
           createdAt: Date.now(),
         })
         created.push(ts)
@@ -2511,6 +2642,8 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
         createdAt: existing?.createdAt ?? Date.now(),
         // 重存（如设发布目标）不能把已采集的账号概况丢掉
         ...(existing?.profile ? { profile: existing.profile } : {}),
+        // 对话排期的会话句柄是服务端状态，重存账号不能丢
+        ...(existing?.planChat ? { planChat: existing.planChat } : {}),
         ...(cadence ? { cadence } : {}),
         ...(pillars ? { pillars } : {}),
       }
@@ -2834,16 +2967,12 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
     requestBody: 'buffered',
     fetch: async () => {
       const g = domain.global.get() as Record<string, unknown>
-      const autoRun = typeof g['scheduler:autoRun'] === 'boolean'
-        ? g['scheduler:autoRun'] as boolean
-        : config.publish.autoRun
       const tickSeconds = typeof g['scheduler:tickSeconds'] === 'number'
         ? g['scheduler:tickSeconds'] as number
         : config.publish.tickSeconds
       return json({
         ok: true,
         data: {
-          autoRun,
           tickSeconds,
           minGapMinutes: config.publish.minGapMinutes,
           dailyLimitPerAccount: config.publish.dailyLimitPerAccount,
@@ -2880,25 +3009,24 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
     },
   }
 
-  /** POST /api/media/scheduler/save — 运行期开关定时发布（存 domain global，持久于媒体库）。 */
+  /** POST /api/media/scheduler/save — 运行期调整巡检间隔（存 domain global，持久于媒体库）。 */
   const schedulerSave: ConnectionFetchRoute = {
     path: `${ROUTE_PREFIX}/scheduler/save`,
     methods: ['POST'],
     requestBody: 'buffered',
     fetch: async (request) => {
-      const body = await readJson<{ autoRun?: boolean; tickSeconds?: number }>(request)
+      const body = await readJson<{ tickSeconds?: number }>(request)
       if (!body) {
         return json({ ok: false, code: 'INVALID_REQUEST', message: 'body 不能为空' }, 400)
       }
       const g: Record<string, unknown> = { ...(domain.global.get() as Record<string, unknown>) }
-      if (typeof body.autoRun === 'boolean') g['scheduler:autoRun'] = body.autoRun
       if (typeof body.tickSeconds === 'number' && Number.isFinite(body.tickSeconds)) {
         g['scheduler:tickSeconds'] = Math.max(15, Math.round(body.tickSeconds))
       }
       await domain.global.set(g)
       return json({
         ok: true,
-        data: { autoRun: g['scheduler:autoRun'], tickSeconds: g['scheduler:tickSeconds'] },
+        data: { tickSeconds: g['scheduler:tickSeconds'] },
       })
     },
   }
@@ -3389,12 +3517,12 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
   }
 
   // ---------------------------------------------------------- workspace
-  /** GET /api/media/workspace — 当前工作文件夹（root 空串=未设置）。 */
+  /** GET /api/media/workspace — 当前工作文件夹（root 空串=未设置）+ 建议的专用工作区路径。 */
   const workspaceGet: ConnectionFetchRoute = {
     path: `${ROUTE_PREFIX}/workspace`,
     methods: ['GET'],
     requestBody: 'buffered',
-    fetch: async () => json({ ok: true, data: { root: workspaceRoot(domain) } }),
+    fetch: async () => json({ ok: true, data: { root: workspaceRoot(domain), suggested: suggestWorkspaceRoot() } }),
   }
 
   /** POST /api/media/workspace/set — 设置/清除工作文件夹（root 空串=清除）。目录不可用时 400。 */
@@ -3487,7 +3615,7 @@ export function mediaRoutes(domain: MediaDomain, ctx: Context, config: MediaConf
     hotspotFetchersGet, hotspotFetchersSave,
     articles, articleSave, articleDelete, articleApprove, articleRewrite, articleIllustrate, articleGenerate,
     articleAsset, asset, assetGenerate, assetsListRoute(domain), content,
-    plan, planSave, planSlots, planChat, planApply, planApprove, planRun, planDelete,
+    plan, planSave, planSlots, planChat, planChatReset, planApply, planApprove, planRun, planDelete,
     publishManual,
     openExternalUrl,
     review, reviewSave, reviewSync,
