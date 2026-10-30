@@ -968,9 +968,11 @@ async function finalizeChapterCore(opts: {
   }
   for (const item of items) await pendings.put(item.id, item)
   void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: true, ms: Date.now() - t0, model: result.model ?? modelLabel(opts.selection) })
-  // beat → finalized
+  // beat → finalized；已完结的书一旦又有定稿，说明在继续写，状态回到「写作中」
+  // （批量成书收官时会按区间全定稿重新标回 finished）
   await domain.table('book').update(book.id, b => ({
     ...b,
+    status: b.status === 'finished' ? 'writing' : b.status,
     outline: { ...b.outline, beats: b.outline.beats.map(x => x.no === no ? { ...x, status: 'finalized' } : x) },
   }))
   return { status: 'ok', items, extract, sessionId: result.sessionId, baseline: result.baseline }
