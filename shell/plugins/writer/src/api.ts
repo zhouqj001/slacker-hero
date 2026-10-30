@@ -15,9 +15,11 @@ import {
   type WriterDomain,
 } from './domain.ts'
 import type { WriterConfig } from './config.ts'
+import type { ModelRef } from './config.ts'
 import {
   DEFAULT_STYLE_CARD,
   buildChapterPrompts,
+  buildCompressSummaryPrompts,
   buildFinalizePrompts,
   buildMoreBeatsPrompts,
   buildNewVolumePrompts,
@@ -25,17 +27,18 @@ import {
   buildWizardPrompts,
   parseArchetypeId,
   parseBeatsProposal,
+  parseCompressSummary,
   parseFinalizeExtract,
   parseReviewResult,
   parseWizardProposal,
   resolveLlmError,
   stripHookMark,
-  type AssembleSetting,
   type BeatsProposal,
   type LlmErrorInfo,
   type WizardProposal,
 } from './llm.ts'
-import { analyzeChapter, countWords, goldenRuleFor } from './quality.ts'
+import { GRADE_POLICIES, GRADE_RANK, analyzeChapter, countWords, goldenRuleFor, type QualityGrade, type QualityIssue } from './quality.ts'
+import { buildChapterContext, buildReviewContext, type ContextBeat, type ContextForeshadow, type ContextSetting } from './context.ts'
 import { archetypeSummaries, resolveArchetype } from './style.ts'
 import { checkQuota, findLatestLog, findSuccessLog, idempotencyKey, quotaUsage } from './quota.ts'
 import { browserPool } from './platforms/browser.ts'
@@ -60,6 +63,8 @@ import { LoginCancelled, LoginTimeout, runLoginFlow } from './platforms/login.ts
 interface WriterSessionController {
   create(request: { sessionId?: string; agentPreset?: string }): Promise<{ sessionId: string }>
   rename(request: { sessionId: string; title: string }): Promise<{ title: string }>
+  /** 会话级模型选择（plan ③；dsh 真实服务提供，缺失时软降级为默认模型）。 */
+  selectModel?(request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }): Promise<{ selected: unknown }>
   prompt(
     request: {
       requestId: string
@@ -126,6 +131,42 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
+/** 任务分类（plan ③）：正文/审稿/辅助各自可配模型。 */
+type LlmTask = 'write' | 'review' | 'utility'
+
+/** global KV 键：模型分工（优先于插件 config）。 */
+const LLM_MODELS_KEY = 'writer:llmModels'
+
+/** 宽松解析模型引用（provider/model 必须非空，其余可缺）。 */
+function asModelRef(v: unknown): ModelRef | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const rec = v as Record<string, unknown>
+  const provider = typeof rec['provider'] === 'string' ? rec['provider'].trim() : ''
+  const model = typeof rec['model'] === 'string' ? rec['model'].trim() : ''
+  if (!provider || !model) return undefined
+  const effort = typeof rec['reasoningEffort'] === 'string' && rec['reasoningEffort'].trim() ? rec['reasoningEffort'].trim() : undefined
+  return { provider, model, reasoningEffort: effort }
+}
+
+/** 当前模型分工：global KV 覆盖 > 插件 config > 未配置（沿用默认模型）。 */
+function modelConfigOf(domain: WriterDomain, config: WriterConfig): Record<LlmTask, ModelRef | undefined> {
+  const raw = (domain.global.get() as Record<string, unknown>)[LLM_MODELS_KEY]
+  const store = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+  return {
+    write: asModelRef(store['write']) ?? asModelRef(config.llm.write),
+    review: asModelRef(store['review']) ?? asModelRef(config.llm.review),
+    utility: asModelRef(store['utility']) ?? asModelRef(config.llm.utility),
+  }
+}
+
+function resolveModelRef(task: LlmTask, domain: WriterDomain, config: WriterConfig): ModelRef | undefined {
+  return modelConfigOf(domain, config)[task]
+}
+
+function modelLabel(ref: ModelRef | undefined): string | undefined {
+  return ref ? `${ref.provider}/${ref.model}` : undefined
+}
+
 /**
  * 会话派工（SSE 版）：建/续会话 → prompt → follow 循环。
  * 每个 assistant/message 事件发一帧 {type:'text', text:整段全文}（替换式；
@@ -139,13 +180,23 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 async function runSessionSse(
   ctrl: WriterSessionController,
   send: (data: object) => void,
-  opts: { title: string; prompt: string; signal: AbortSignal; sessionId?: string; baseline?: number },
-): Promise<{ text: string; failure?: LlmErrorInfo; sessionId: string | null; baseline: number }> {
+  opts: {
+    title: string
+    prompt: string
+    signal: AbortSignal
+    sessionId?: string
+    baseline?: number
+    /** 任务分类与目标模型（未配置则沿用默认）。 */
+    task?: LlmTask
+    selection?: ModelRef
+  },
+): Promise<{ text: string; failure?: LlmErrorInfo; sessionId: string | null; baseline: number; model?: string }> {
   const base = opts.baseline ?? 0
   let sessionId = opts.sessionId ?? null
   let accepted = false
   let text = ''
   let failure: LlmErrorInfo | undefined
+  let model: string | undefined
   try {
     if (sessionId === null) {
       const created = await ctrl.create({})
@@ -154,6 +205,26 @@ async function runSessionSse(
       try {
         await ctrl.rename({ sessionId, title: opts.title })
       } catch { /* 命名失败不阻塞 */ }
+      // 仅新建会话时选模型（重试复用同一会话，模型已持久在该会话上）
+      if (opts.selection && ctrl.selectModel) {
+        try {
+          await ctrl.selectModel({
+            sessionId,
+            provider: opts.selection.provider,
+            model: opts.selection.model,
+            reasoningEffort: opts.selection.reasoningEffort,
+          })
+          model = modelLabel(opts.selection)
+        } catch (err) {
+          const msg = `模型切换失败，已沿用默认模型：${err instanceof Error ? err.message : String(err)}`
+          console.warn(`[writer] ${msg}`)
+          send({
+            type: 'model/warn',
+            task: opts.task ?? 'write',
+            message: msg,
+          })
+        }
+      }
     } else {
       send({ type: 'session', sessionId, baseline: base })
     }
@@ -233,14 +304,22 @@ async function runSessionSse(
     }
   }
   // 每成功派一个 prompt 就等于该会话多了一个回合（mode:'queue' 排队执行）
-  return { text, failure, sessionId, baseline: base + (accepted ? 1 : 0) }
+  return { text, failure, sessionId, baseline: base + (accepted ? 1 : 0), model }
 }
 
 /** 聚合版（JSON 路由用）：不转发 text 帧，直接要全文。 */
 async function askSession(
   ctrl: WriterSessionController,
-  opts: { title: string; prompt: string; signal: AbortSignal; sessionId?: string; baseline?: number },
-): Promise<{ text: string; failure?: LlmErrorInfo; sessionId: string | null; baseline: number }> {
+  opts: {
+    title: string
+    prompt: string
+    signal: AbortSignal
+    sessionId?: string
+    baseline?: number
+    task?: LlmTask
+    selection?: ModelRef
+  },
+): Promise<{ text: string; failure?: LlmErrorInfo; sessionId: string | null; baseline: number; model?: string }> {
   return runSessionSse(ctrl, () => {}, opts)
 }
 
@@ -385,6 +464,10 @@ interface BookRec {
     }[]
   }
   memorySummary: string
+  /** 全局摘要压缩游标与状态（plan ②）。 */
+  memoryThroughChapter?: number
+  memoryCompressedAt?: number
+  memorySummaryStale?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -401,10 +484,17 @@ function settingKind(raw: string | undefined): 'character' | 'world' | 'item' | 
   return raw === 'character' || raw === 'item' || raw === 'faction' ? raw : 'world'
 }
 
-function settingsOf(domain: WriterDomain, bookId: string): AssembleSetting[] {
+function settingsOf(domain: WriterDomain, bookId: string): ContextSetting[] {
   return [...domain.table('setting').entries()]
     .map(([, v]) => v)
     .filter(s => s.bookId === bookId)
+}
+
+/** 本书全部伏笔（上下文检索输入）。 */
+function foreshadowsOf(domain: WriterDomain, bookId: string): ContextForeshadow[] {
+  return [...domain.table('foreshadow').entries()]
+    .map(([, v]) => v)
+    .filter(f => f.bookId === bookId)
 }
 
 /** 未回收伏笔行（prompt/续排用）。 */
@@ -446,6 +536,33 @@ interface ChapterRec {
 
 function getChapter(domain: WriterDomain, bookId: string, no: number): ChapterRec | null {
   return domain.table('chapter').get(chapterId(bookId, no)) as ChapterRec | null
+}
+
+/** 章题规范化：剥掉 LLM 自带的错误「第N章」前缀，统一补正确序号（无题兜底「第N章」）。 */
+function normBeatTitle(title: string | undefined, no: number): string {
+  const bare = (title ?? '').trim().replace(/^第[0-9〇零一二两三四五六七八九十百千]+章\s*/, '')
+  return bare ? `第${no}章 ${bare}` : `第${no}章`
+}
+
+/** 启动自愈：补齐历史章纲/章节标题缺失的「第N章」前缀（幂等，改了才写）。 */
+async function normalizeBeatTitles(domain: WriterDomain): Promise<void> {
+  const books = domain.table('book')
+  const chapters = domain.table('chapter')
+  for (const [id, b] of [...books.entries()]) {
+    let changed = false
+    const beats = b.outline.beats.map(x => {
+      const t = normBeatTitle(x.title, x.no)
+      if (t !== x.title) { changed = true; return { ...x, title: t } }
+      return x
+    })
+    if (changed) await books.update(id, v => ({ ...v, outline: { ...v.outline, beats } }))
+    for (const x of beats) {
+      const ch = getChapter(domain, b.id, x.no)
+      if (!ch) continue
+      const t = normBeatTitle(ch.title, x.no)
+      if (t !== ch.title) await chapters.update(chapterId(b.id, x.no), v => ({ ...v, title: t }))
+    }
+  }
 }
 
 /** 发布台账记录（quota/发布路由用）。 */
@@ -511,7 +628,21 @@ function authorProfileOf(domain: WriterDomain): string {
 /** 创作日志落表（best-effort：日志失败绝不影响主流程）。 */
 async function writeLog(
   domain: WriterDomain,
-  entry: { bookId: string; no?: number; stage: 'generate' | 'beats' | 'finalize' | 'review' | 'rewrite'; ok: boolean; ms: number; issueCount?: number; err?: string },
+  entry: {
+    bookId: string
+    no?: number
+    stage: 'generate' | 'beats' | 'finalize' | 'review' | 'rewrite'
+    ok: boolean
+    ms: number
+    issueCount?: number
+    /** 质量分级（generate/rewrite 阶段）。 */
+    grade?: string
+    /** 本次调用模型（provider/model，按任务分模型后可见）。 */
+    model?: string
+    /** prompt 上下文字符数（分层检索后的装配量）。 */
+    ctxChars?: number
+    err?: string
+  },
 ): Promise<void> {
   try {
     const id = newId('wl')
@@ -559,8 +690,66 @@ function flavorHitsOf(report: { issues: { code: string; message: string }[] }): 
 // 一键成书核心：单章生成 / 单章定稿 / 记忆入册（HTTP 路由与批量路由共用）
 // ------------------------------------------------------------------
 
-/** 一键成书运行中任务（bookId 集合；同一本书同时只允许一个批量任务）。 */
-const runningBookJobs = new Set<string>()
+/** 一键成书任务（按 bookId 常驻：页面断线只取消订阅，不中断生成）。 */
+interface BookJob {
+  bookId: string
+  target: number
+  autoMemory: boolean
+  refs?: string[]
+  signal: AbortController
+  startedAt: number
+  frames: Record<string, unknown>[]
+  subscribers: Set<(frame: Record<string, unknown>) => void>
+  done: boolean
+}
+
+/** 每本书只保留最近一个任务（含已结束的，供断线后补看结果）。 */
+const bookJobs = new Map<string, BookJob>()
+/** 帧缓冲上限：够一次重连回放即可，超出丢最旧的。 */
+const BOOK_JOB_FRAME_LIMIT = 800
+
+/** 写一帧进任务缓冲并广播给订阅者；done 帧落定后清空订阅。 */
+function emitBookJob(job: BookJob, frame: Record<string, unknown>): void {
+  if (job.done) return
+  job.frames.push(frame)
+  if (job.frames.length > BOOK_JOB_FRAME_LIMIT) job.frames.splice(0, job.frames.length - BOOK_JOB_FRAME_LIMIT)
+  if (frame['type'] === 'done') job.done = true
+  for (const sub of [...job.subscribers]) {
+    try { sub(frame) } catch { job.subscribers.delete(sub) }
+  }
+  if (job.done) job.subscribers.clear()
+}
+
+/** 把一次 HTTP 请求接成任务的 SSE 订阅：回放已发生的帧，再实时追加。 */
+function bookJobSse(job: BookJob, request: Request): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enc = new TextEncoder()
+      let closed = false
+      const ping = setInterval(() => push({ type: 'ping', ts: Date.now() }), 15_000)
+      function finish(): void {
+        if (closed) return
+        closed = true
+        clearInterval(ping)
+        job.subscribers.delete(push)
+        try { controller.close() } catch { /* 已断开 */ }
+      }
+      function push(frame: Record<string, unknown>): void {
+        if (closed) return
+        try { controller.enqueue(enc.encode(sseEvent(frame))) } catch { closed = true }
+        if (frame['type'] === 'done') finish()
+      }
+      for (const frame of job.frames) push(frame)
+      if (job.done) {
+        finish()
+        return
+      }
+      job.subscribers.add(push)
+      request.signal.addEventListener('abort', finish, { once: true })
+    },
+  })
+  return sseResponse(stream)
+}
 
 /** 单章生成结果：ok = 成稿；error = LLM 硬失败/空响应（changed 表示已落部分稿）。 */
 type GenerateChapterOutcome =
@@ -582,6 +771,10 @@ async function generateChapterCore(opts: {
   bookId: string
   no: number
   refs?: string[]
+  /** 上一稿质检问题（重写时定向修复）。 */
+  repair?: { grade: QualityGrade; issues: QualityIssue[] }
+  /** 正文任务模型（plan ③）。 */
+  selection?: ModelRef
 }): Promise<GenerateChapterOutcome> {
   const { domain, ctrl, send, signal, no } = opts
   const book = getBook(domain, opts.bookId)
@@ -593,17 +786,35 @@ async function generateChapterCore(opts: {
     ch = blankChapter(book.id, no, beat.title)
     await chapters.put(ch.id, ch)
   }
-  // 前情装配：全局摘要 + 近 3 章摘要（升序）+ 上一章末 300 字
+  // 分层检索：P0 必读 / P1 相关 / P2 背景（context.ts），不再全量注入
   const prev = getChapter(domain, book.id, no - 1)
-  const recentSummaries = [...chapters.entries()].map(([, v]) => v)
+  const chapterSummaries = [...chapters.entries()].map(([, v]) => v)
     .filter(c => c.bookId === book.id && c.no < no && !!c.summary?.trim())
-    .sort((a, b) => a.no - b.no)
-    .slice(-3)
     .map(c => ({ no: c.no, summary: c.summary as string }))
   const archetype = resolveArchetype(book.archetype ?? '')
+  const allSettings = settingsOf(domain, book.id)
   // 显式引用：编辑器「关联设定」标记（只保留真实存在的设定名）
-  const knownNames = new Set(settingsOf(domain, book.id).map(s => s.name))
+  const knownNames = new Set(allSettings.map(s => s.name))
   const explicitRefs = [...new Set(opts.refs ?? [])].filter(r => typeof r === 'string' && knownNames.has(r))
+  const beatCtx: ContextBeat = {
+    no,
+    title: beat.title,
+    beat: beat.beat,
+    hook: beat.hook,
+    promise: beat.promise,
+    uncertainty: beat.uncertainty,
+    payoffOf: beat.payoffOf,
+  }
+  const context = buildChapterContext({
+    book: { memorySummary: book.memorySummary, memoryThroughChapter: book.memoryThroughChapter },
+    beat: beatCtx,
+    settings: allSettings,
+    foreshadows: foreshadowsOf(domain, book.id),
+    chapterSummaries,
+    prevTail: prev?.content ? prev.content.slice(-300) : '',
+    explicitRefs,
+  })
+  const repairNotes = opts.repair?.issues.map(i => `[${i.level}] ${i.code}：${i.message}`)
   const prompt = buildChapterPrompts({
     styleCard: book.styleCard || DEFAULT_STYLE_CARD,
     archetype,
@@ -617,13 +828,9 @@ async function generateChapterCore(opts: {
     uncertainty: beat.uncertainty ?? '',
     isCool: beat.isCool === true,
     targetWords: book.chapterWords,
-    settings: settingsOf(domain, book.id),
-    explicitRefs,
-    memorySummary: book.memorySummary,
-    recentSummaries,
-    prevTail: prev?.content ? prev.content.slice(-300) : '',
-    dueForeshadows: dueForeshadowLines(domain, book.id, no),
     goldenRule: goldenRuleFor(no),
+    context,
+    repairNotes,
   })
   const t0 = Date.now()
   const result = await runSessionSse(ctrl, send, {
@@ -632,6 +839,8 @@ async function generateChapterCore(opts: {
     signal,
     sessionId: opts.sessionId,
     baseline: opts.baseline,
+    task: 'write',
+    selection: opts.selection,
   })
   const stripped = stripHookMark(result.text)
   const report = analyzeChapter(stripped.content, {
@@ -649,6 +858,9 @@ async function generateChapterCore(opts: {
     ok: !info,
     ms: Date.now() - t0,
     issueCount: report.issues.length,
+    grade: report.grade,
+    model: result.model ?? modelLabel(opts.selection),
+    ctxChars: prompt.length,
     err: info?.code,
   })
   if (changed) {
@@ -695,6 +907,8 @@ async function finalizeChapterCore(opts: {
   baseline?: number
   bookId: string
   no: number
+  /** 辅助任务模型（提取/压缩等，plan ③）。 */
+  selection?: ModelRef
 }): Promise<FinalizeChapterOutcome> {
   const { domain, ctrl, signal, no } = opts
   const book = getBook(domain, opts.bookId)
@@ -714,11 +928,13 @@ async function finalizeChapterCore(opts: {
     signal,
     sessionId: opts.sessionId,
     baseline: opts.baseline,
+    task: 'utility',
+    selection: opts.selection,
   })
   const extract = result.failure ? null : parseFinalizeExtract(result.text)
   if (!extract) {
     const info = result.failure ?? resolveLlmError('MALFORMED_RESPONSE')
-    void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: false, ms: Date.now() - t0, err: info.code })
+    void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: false, ms: Date.now() - t0, model: result.model ?? modelLabel(opts.selection), err: info.code })
     return { status: 'fail', info, sessionId: result.sessionId, baseline: result.baseline }
   }
   // 重定稿：本章旧出处条目先失效（新条目确认后重新入册），再替换旧 pending
@@ -748,7 +964,7 @@ async function finalizeChapterCore(opts: {
     items.push({ id: newId('pd'), bookId: book.id, chapterNo: no, kind: 'timeline', payload: { anchors: extract.timeline }, createdAt: now })
   }
   for (const item of items) await pendings.put(item.id, item)
-  void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: true, ms: Date.now() - t0 })
+  void writeLog(domain, { bookId: book.id, no, stage: 'finalize', ok: true, ms: Date.now() - t0, model: result.model ?? modelLabel(opts.selection) })
   // beat → finalized
   await domain.table('book').update(book.id, b => ({
     ...b,
@@ -767,6 +983,9 @@ async function applyPendingRec(domain: WriterDomain, pending: PendingRec): Promi
   if (pending.kind === 'summary') {
     const text = typeof pending.payload['text'] === 'string' ? pending.payload['text'] : ''
     if (text) {
+      // 章摘要落盘（近章召回/复审依据），同时保留 book.memorySummary 作为短期兜底
+      const ch = getChapter(domain, pending.bookId, pending.chapterNo)
+      if (ch) await chapters.put(ch.id, { ...ch, summary: text, summaryStale: false, updatedAt: Date.now() })
       await books.update(pending.bookId, b => ({ ...b, memorySummary: text, updatedAt: Date.now() }))
     } else {
       skipped.push('摘要内容为空，跳过')
@@ -860,6 +1079,60 @@ async function applyPendingRec(domain: WriterDomain, pending: PendingRec): Promi
   return skipped
 }
 
+/**
+ * 记忆滚动压缩（plan ②）：memoryThroughChapter 之后累积 ≥5 章时，
+ * 用 utility 模型把「旧摘要 + 新章摘要」压成 ≤300 字，写回 book.memorySummary
+ * 并推进 memoryThroughChapter；失败 fail-soft（保留旧摘要 + 置 stale），不阻塞成书。
+ */
+async function compressMemory(opts: {
+  domain: WriterDomain
+  ctrl: WriterSessionController
+  signal: AbortSignal
+  bookId: string
+  selection?: ModelRef
+}): Promise<{ ok: boolean; throughNo: number }> {
+  const { domain, ctrl, signal } = opts
+  const book = getBook(domain, opts.bookId)
+  const through = book.memoryThroughChapter ?? 0
+  const pending = [...domain.table('chapter').entries()]
+    .map(([, v]) => v as ChapterRec)
+    .filter(c => c.bookId === book.id && c.no > through && !!c.summary?.trim())
+    .sort((a, b) => a.no - b.no)
+  const latestNo = pending.length > 0 ? pending[pending.length - 1].no : through
+  if (latestNo - through < 5) return { ok: false, throughNo: through }
+  const prompt = buildCompressSummaryPrompts({
+    oldSummary: book.memorySummary,
+    newSummary: pending.map(c => `第${c.no}章：${c.summary as string}`).join('\n'),
+    throughNo: latestNo,
+    targetChars: 300,
+  })
+  const t0 = Date.now()
+  const result = await askSession(ctrl, {
+    title: `记忆压缩：${book.name}`,
+    prompt, signal, task: 'utility', selection: opts.selection,
+  })
+  const merged = result.failure ? null : parseCompressSummary(result.text)
+  const books = domain.table('book')
+  if (merged) {
+    await books.update(book.id, b => ({
+      ...b,
+      memorySummary: merged,
+      memoryThroughChapter: latestNo,
+      memoryCompressedAt: Date.now(),
+      memorySummaryStale: false,
+      updatedAt: Date.now(),
+    }))
+  } else {
+    await books.update(book.id, b => ({ ...b, memorySummaryStale: true, updatedAt: Date.now() }))
+  }
+  void writeLog(domain, {
+    bookId: book.id, stage: 'finalize', ok: !!merged, ms: Date.now() - t0,
+    model: result.model ?? modelLabel(opts.selection),
+    err: merged ? undefined : (result.failure?.code ?? 'MALFORMED_RESPONSE'),
+  })
+  return { ok: !!merged, throughNo: latestNo }
+}
+
 // ------------------------------------------------------------------
 // 路由表
 // ------------------------------------------------------------------
@@ -884,6 +1157,9 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
   const pendings = domain.table('pending')
   const chapters = domain.table('chapter')
   const publishLogs = domain.table('publish_log')
+
+  // 历史数据自愈：补齐缺失的「第N章」标题前缀（幂等；后台跑不阻塞路由挂载）
+  void normalizeBeatTitles(domain).catch(() => { /* 自愈失败不阻塞插件启动 */ })
 
   return [
     // ---------------- 账号 ----------------
@@ -1349,6 +1625,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
             const t0 = Date.now()
             const result = await runSessionSse(sessionCtrl(), send, {
               title, prompt, signal: request.signal, sessionId: body.sessionId, baseline: body.baseline,
+              task: 'utility', selection: resolveModelRef('utility', domain, config),
             })
             const proposal: WizardProposal | BeatsProposal | null = kind === 'wizard'
               ? parseWizardProposal(result.text)
@@ -1398,6 +1675,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
             const out = await generateChapterCore({
               domain, ctrl: sessionCtrl(), send, signal: request.signal,
               sessionId: body.sessionId, baseline: body.baseline, bookId: book.id, no, refs: body.refs,
+              selection: resolveModelRef('write', domain, config),
             })
             if (out.status === 'error') {
               send({ type: 'error', code: out.info.code, message: out.info.zh, action: out.info.action, partial: out.changed })
@@ -1423,28 +1701,38 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
     // ---------------- 一键成书（批量）----------------
 
     // 自动循环：续排章纲 → 逐章生成（词数/钩子不达标重试 1 次）→ 定稿回写
-    // → 记忆自动入册。SSE 只报进度（章内正文流不转发）；同一本书同时只允许
-    // 一个任务；中止请求即中断；已 finalized 的章直接跳过 → 天然断点续跑。
+    // → 记忆自动入册。任务脱离页面常驻：断线只取消订阅，重进页面可接回进度；
+    // 已 finalized 的章直接跳过 → 天然断点续跑。
     route('/api/writer/generate/book', ['POST'], async (request) => {
       const body = await readJson<{ bookId?: string; target?: number; autoMemory?: boolean; refs?: string[] }>(request) ?? {}
       const book = getBook(domain, body.bookId)
       const target = Math.min(Math.max(Math.floor(body.target ?? 100), 1), 300)
       const autoMemory = body.autoMemory !== false
-      if (runningBookJobs.has(book.id)) return fail('BOOK_RUNNING', '该书已有一键成书任务在运行，请等它结束或刷新页面')
-      runningBookJobs.add(book.id)
-      const stream = new ReadableStream({
-        async start(controller) {
-          const enc = new TextEncoder()
-          let closed = false
-          const send = (data: object): void => {
-            if (closed) return
-            try { controller.enqueue(enc.encode(sseEvent(data))) } catch { /* 流已断 */ }
-          }
-          const ping = setInterval(() => send({ type: 'ping', ts: Date.now() }), 15_000)
+      // 同一本书已有任务在跑 → 直接接上（重复点击 / 刷新页面都幂等），不新开
+      const current = bookJobs.get(book.id)
+      let job: BookJob
+      if (current && !current.done) {
+        job = current
+      } else {
+        job = {
+          bookId: book.id, target, autoMemory, refs: body.refs,
+          signal: new AbortController(), startedAt: Date.now(),
+          frames: [], subscribers: new Set(), done: false,
+        }
+        bookJobs.set(book.id, job)
+        // 执行体脱离本次请求：页面断线只断开订阅，生成继续跑
+        void (async () => {
+          const request = { signal: job.signal.signal }
+          const send = (data: object): void => emitBookJob(job, data as Record<string, unknown>)
           let generated = 0
           let skipped = 0
           let words = 0
           let failures = 0
+          // 质量不达标跳过的章数（不计入 failStreak，避免文风问题误杀整卷任务）
+          let qualityFailures = 0
+          // 按任务分模型（plan ③）：正文 / 辅助；未配置则为 undefined（沿用默认模型）
+          const writeRef = resolveModelRef('write', domain, config)
+          const utilityRef = resolveModelRef('utility', domain, config)
           // 连续失败熔断：单章故障只跳过不计致命，连败 3 章大概率系统性问题（quota/服务），才终止
           const FAIL_STREAK_LIMIT = 3
           let failStreak = 0
@@ -1478,16 +1766,18 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                     count,
                   }),
                   signal: request.signal,
+                  task: 'utility',
+                  selection: utilityRef,
                 })
                 const proposal = result.failure ? null : parseBeatsProposal(result.text, false)
                 if (!proposal || proposal.beats.length === 0) {
                   if (request.signal.aborted) break
                   const info = result.failure ?? resolveLlmError('MALFORMED_RESPONSE')
-                  void writeLog(domain, { bookId: cur.id, stage: 'beats', ok: false, ms: Date.now() - t0, err: info.code })
+                  void writeLog(domain, { bookId: cur.id, stage: 'beats', ok: false, ms: Date.now() - t0, model: result.model ?? modelLabel(utilityRef), err: info.code })
                   send({ type: 'error', code: info.code, message: `续排章纲失败：${info.zh}`, fatal: true })
                   break
                 }
-                void writeLog(domain, { bookId: cur.id, stage: 'beats', ok: true, ms: Date.now() - t0 })
+                void writeLog(domain, { bookId: cur.id, stage: 'beats', ok: true, ms: Date.now() - t0, model: result.model ?? modelLabel(utilityRef) })
                 const before = cur.outline.beats.length
                 await books.update(cur.id, bk => {
                   const existing = new Set(bk.outline.beats.map(x => x.no))
@@ -1495,7 +1785,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                     .filter(x => x && typeof x.no === 'number' && typeof x.beat === 'string' && !existing.has(x.no))
                     .map(x => ({
                       no: x.no,
-                      title: x.title?.trim() || `第${x.no}章`,
+                      title: normBeatTitle(x.title, x.no),
                       beat: x.beat as string,
                       hook: x.hook?.trim() || '章末留钩子',
                       promise: x.promise?.trim() || undefined,
@@ -1528,51 +1818,93 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
               const existingCh = getChapter(domain, book.id, no)
               const needGen = !(beat.status === 'drafted' && existingCh != null && existingCh.content.trim() !== '')
               let retried = 0
+              /** 质量门槛：低于 config.quality.minGrade 才返工（默认 silver，即 bronze/reject 返工）。 */
+              const minRank = GRADE_RANK[config.quality.minGrade]
               if (needGen) {
                 send({ type: 'chapter/start', no, title: beat.title, index: no, target })
                 // 同章重试沿用会话（LLM 可见上一稿）；跨章新会话（prompt 自带前情装配）
                 let chSess: { sessionId?: string; baseline?: number } = {}
                 let out: GenerateChapterOutcome | null = null
-                for (let attempt = 0; attempt < 2; attempt++) {
+                let grade: QualityGrade | null = null
+                let repair: { grade: QualityGrade; issues: QualityIssue[] } | undefined
+                let rewriteCount = 0
+                let errorRetries = 0
+                let verdict: 'accept' | 'reject' | 'fail' = 'fail'
+                while (true) {
                   if (request.signal.aborted) break
                   try {
                     out = await generateChapterCore({
                       domain, ctrl: sessionCtrl(), send: () => {}, signal: request.signal,
-                      sessionId: chSess.sessionId, baseline: chSess.baseline, bookId: cur.id, no, refs: body.refs,
+                      sessionId: chSess.sessionId, baseline: chSess.baseline, bookId: cur.id, no,
+                      refs: body.refs, repair, selection: writeRef,
                     })
-                  } catch (err) {
+                  } catch {
                     // 网络抖动等瞬时异常按失败处理，不毁掉整卷任务
                     if (request.signal.aborted) break
                     out = null
                   }
                   if (out) chSess = { sessionId: out.sessionId ?? undefined, baseline: out.baseline }
                   if (request.signal.aborted) break
-                  if (out?.status === 'ok') {
-                    // 质量闸：词数下限与章末钩子（仅首轮重试，末轮接受现状）
-                    const floor = Math.max(200, Math.floor(cur.chapterWords * 0.55))
-                    const short = out.quality.words < floor
-                    const weakHook = out.chapter.hookOk === false
-                    if ((short || weakHook) && attempt === 0) {
-                      retried = attempt + 1
-                      send({ type: 'chapter/retry', no, reason: short ? 'WORDS_SHORT' : 'HOOK_WEAK' })
+                  if (!out || out.status === 'error') {
+                    // 硬失败（空响应/LLM 错误）：瞬时异常最多补跑 1 次
+                    if (errorRetries < 1) {
+                      errorRetries++
+                      retried = rewriteCount + errorRetries
+                      send({ type: 'chapter/retry', no, reason: out?.info.code ?? 'SERVER', grade, attempt: retried })
                       await sleep(1500, request.signal)
                       continue
                     }
+                    verdict = 'fail'
                     break
                   }
-                  if (attempt === 0) {
-                    retried = attempt + 1
-                    send({ type: 'chapter/retry', no, reason: out?.info.code ?? 'SERVER' })
-                    await sleep(1500, request.signal)
-                    continue
+                  grade = out.quality.grade
+                  // 字数硬闸：低于目标章字数 80% 视为未完成（与分级无关，一并进定向重写）
+                  const wordsFloor = Math.max(1000, Math.floor(cur.chapterWords * 0.8))
+                  const wordsOk = out.quality.words >= wordsFloor
+                  // 达标即接受；否则按 GRADE_POLICIES 做定向重写（repair 带上一稿 issues）
+                  if (GRADE_RANK[grade] >= minRank && wordsOk) {
+                    verdict = 'accept'
+                    break
                   }
+                  const budget = Math.min(GRADE_POLICIES[grade].maxRewrites, config.quality.maxRewrites)
+                  if (rewriteCount >= budget) {
+                    // 预算用尽：策略可接受且字数落到 70% 兜底线以上 → 接受，否则跳过本章
+                    const tolerable = GRADE_POLICIES[grade].accept
+                      && out.quality.words >= Math.max(1000, Math.floor(cur.chapterWords * 0.7))
+                    verdict = tolerable ? 'accept' : 'reject'
+                    break
+                  }
+                  rewriteCount++
+                  retried = rewriteCount
+                  repair = {
+                    grade,
+                    issues: wordsOk ? out.quality.issues : [...out.quality.issues, {
+                      level: 'warn', code: 'WORDS_SHORT',
+                      message: `正文仅 ${out.quality.words} 字，未达下限 ${wordsFloor} 字：扩写情节、动作与对话（禁止注水），不要提前收束本章`,
+                    }],
+                  }
+                  send({ type: 'chapter/retry', no, reason: wordsOk ? grade : 'WORDS_SHORT', grade, attempt: rewriteCount })
+                  await sleep(1500, request.signal)
                 }
                 if (request.signal.aborted) break
-                if (!out || out.status === 'error') {
+                if (verdict === 'reject') {
+                  // 质量不达标跳过：计 qualityFailures，不进入 failStreak 熔断（避免文风问题误杀整卷）
+                  qualityFailures++
+                  send({
+                    type: 'chapter/reject', no, grade,
+                    words: out?.status === 'ok' ? out.quality.words : 0,
+                    issues: out?.status === 'ok' ? out.quality.issues.length : 0,
+                    index: no, target,
+                  })
+                  send({ type: 'chapter/skip', no, index: no, target, reason: 'QUALITY_REJECT' })
+                  continue
+                }
+                if (verdict === 'fail' || !out || out.status !== 'ok') {
                   failures++
                   failStreak++
-                  const code = out?.info.code ?? 'SERVER'
-                  const zh = out?.info.zh ?? '未知错误'
+                  const failed = out && out.status === 'error' ? out : null
+                  const code = failed?.info.code ?? 'SERVER'
+                  const zh = failed?.info.zh ?? '未知错误'
                   if (failStreak >= FAIL_STREAK_LIMIT) {
                     send({ type: 'error', code, message: `连续 ${failStreak} 章失败（第 ${no} 章：${zh}），暂停任务；已完成的章已保存，稍后可继续`, fatal: true })
                     break
@@ -1583,10 +1915,13 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 generated++
                 words += out.quality.words
                 failStreak = 0
+                if (rewriteCount > 0) {
+                  send({ type: 'chapter/accept', no, grade, acceptedAfterRewrites: rewriteCount, words: out.quality.words, index: no, target })
+                }
                 send({
                   type: 'chapter/done', no, words: out.quality.words,
                   hookOk: out.chapter.hookOk, issues: out.quality.issues.length,
-                  retried, index: no, target,
+                  retried, grade, index: no, target,
                 })
               }
               if (request.signal.aborted) break
@@ -1596,6 +1931,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
               try {
                 fout = await finalizeChapterCore({
                   domain, ctrl: sessionCtrl(), signal: request.signal, bookId: cur.id, no,
+                  selection: utilityRef,
                 })
               } catch (err) {
                 if (request.signal.aborted) break
@@ -1629,6 +1965,16 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 }
               }
               send({ type: 'finalize/done', no, applied, total: fout.items.length })
+              // 记忆滚动压缩（每累积 5 章一次；失败 fail-soft，不阻塞成书）
+              if (autoMemory && !request.signal.aborted) {
+                try {
+                  const cres = await compressMemory({
+                    domain, ctrl: sessionCtrl(), signal: request.signal, bookId: book.id,
+                    selection: utilityRef,
+                  })
+                  if (cres.ok) send({ type: 'memory/compress', throughNo: cres.throughNo })
+                } catch { /* 压缩失败不阻塞成书 */ }
+              }
             }
             // 全部定稿 → 收官
             let finished = false
@@ -1642,10 +1988,10 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 finished = true
               }
             }
-            send({ type: 'done', target, generated, skipped, words, failures, aborted: request.signal.aborted, finished })
+            send({ type: 'done', target, generated, skipped, words, failures, qualityFailures, aborted: request.signal.aborted, finished })
           } catch (err) {
             if (request.signal.aborted) {
-              send({ type: 'done', target, generated, skipped, words, failures, aborted: true, finished: false })
+              send({ type: 'done', target, generated, skipped, words, failures, qualityFailures, aborted: true, finished: false })
             } else {
               const ext = err as { code?: unknown }
               send({
@@ -1654,17 +2000,37 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
                 message: err instanceof Error ? err.message : String(err),
                 fatal: true,
               })
-              send({ type: 'done', target, generated, skipped, words, failures, aborted: false, finished: false })
+              send({ type: 'done', target, generated, skipped, words, failures, qualityFailures, aborted: false, finished: false })
             }
           } finally {
-            runningBookJobs.delete(book.id)
-            clearInterval(ping)
-            closed = true
-            controller.close()
+            // 兜底：任何异常路径都补一发 done，避免订阅者挂死
+            if (!job.done) {
+              send({ type: 'done', target, generated, skipped, words, failures, qualityFailures, aborted: job.signal.signal.aborted, finished: false })
+            }
           }
-        },
-      })
-      return sseResponse(stream)
+        })()
+      }
+      return bookJobSse(job, request)
+    }),
+
+    route('/api/writer/generate/book/follow', ['GET'], async (request) => {
+      const job = bookJobs.get(queryOf(request).get('bookId') ?? '')
+      if (!job) return fail('NO_JOB', '没有正在运行或刚结束的一键成书任务')
+      return bookJobSse(job, request)
+    }),
+
+    route('/api/writer/generate/book/status', ['GET'], async (request) => {
+      const job = bookJobs.get(queryOf(request).get('bookId') ?? '')
+      if (!job) return json({ ok: true, data: { running: false } })
+      return json({ ok: true, data: { running: !job.done, target: job.target, startedAt: job.startedAt } })
+    }),
+
+    route('/api/writer/generate/book/stop', ['POST'], async (request) => {
+      const body = await readJson<{ bookId?: string }>(request) ?? {}
+      const job = bookJobs.get(body.bookId ?? '')
+      if (!job || job.done) return json({ ok: true, data: { stopped: false } })
+      job.signal.abort()
+      return json({ ok: true, data: { stopped: true } })
     }),
 
     // 定稿回写（JSON 路由）：提取 → pending 待确认区（人工确认才入册，fail-closed）。
@@ -1679,6 +2045,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
       const out = await finalizeChapterCore({
         domain, ctrl: sessionCtrl(), signal: request.signal,
         sessionId: body.sessionId, baseline: body.baseline, bookId: book.id, no,
+        selection: resolveModelRef('utility', domain, config),
       })
       if (out.status === 'fail') {
         return json({ ok: true, data: { fail: out.info, sessionId: out.sessionId, baseline: out.baseline } })
@@ -1727,13 +2094,15 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         if (prev.timeline && prev.timeline.length > 0) recentTimelines.push({ no: i, anchors: prev.timeline })
         if (prev.summary && prev.summary.trim() !== '') recentSummaries.push({ no: i, summary: prev.summary })
       }
+      const reviewCtx = buildReviewContext({ content: ch.content, settings: settingsOf(domain, book.id) })
       const prompt = buildReviewPrompts({
         chapterNo: no,
         chapterTitle: ch.title,
         content: ch.content,
         archetype,
         firstLayer: { stats: report.stats, flavorHits: flavorHitsOf(report) },
-        settings: settingsOf(domain, book.id).map(s => ({ kind: s.kind, name: s.name, summary: s.summary, knownBy: s.knownBy })),
+        settings: reviewCtx.settings.map(s => ({ kind: s.kind, name: s.name, summary: s.summary, knownBy: s.knownBy })),
+        otherSettingNames: reviewCtx.otherNames,
         recentTimelines,
         recentSummaries,
       })
@@ -1744,11 +2113,13 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         signal: request.signal,
         sessionId: body.sessionId,
         baseline: body.baseline,
+        task: 'review',
+        selection: resolveModelRef('review', domain, config),
       })
       const review = result.failure ? null : parseReviewResult(result.text)
       if (!review) {
         const info = result.failure ?? resolveLlmError('MALFORMED_RESPONSE')
-        void writeLog(domain, { bookId: book.id, no, stage: 'review', ok: false, ms: Date.now() - t0, err: info.code })
+        void writeLog(domain, { bookId: book.id, no, stage: 'review', ok: false, ms: Date.now() - t0, model: result.model ?? modelLabel(resolveModelRef('review', domain, config)), err: info.code })
         return json({ ok: true, data: { fail: info, sessionId: result.sessionId, baseline: result.baseline } })
       }
       // 合并写回：审稿结果挂 chapter.quality.review；旧稿从无质检底 → 先铺第一层结果
@@ -1763,7 +2134,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         review: { ...review, blockCount, warnCount, reviewedAt },
       }
       await chapters.put(ch.id, { ...ch, quality, updatedAt: reviewedAt })
-      void writeLog(domain, { bookId: book.id, no, stage: 'review', ok: true, ms: reviewedAt - t0, issueCount: review.issues.length })
+      void writeLog(domain, { bookId: book.id, no, stage: 'review', ok: true, ms: reviewedAt - t0, issueCount: review.issues.length, model: result.model ?? modelLabel(resolveModelRef('review', domain, config)) })
       return json({ ok: true, data: { review: { ...review, blockCount, warnCount, reviewedAt }, quality, sessionId: result.sessionId, baseline: result.baseline } })
     }),
 
@@ -1778,6 +2149,58 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         .sort((a, b) => b.ts - a.ts)
         .slice(0, 200)
       return json({ ok: true, data: { logs } })
+    }),
+
+    // ---------------- 按任务分模型（plan ③）----------------
+
+    // 读/写模型分工：global KV writer:llmModels 覆盖插件 config；未配置 = 跟随默认。
+    route('/api/writer/llm/config', ['GET', 'POST'], async (request) => {
+      const llmSvc = (ctx as unknown as {
+        llm?: {
+          listProviders?(): { id: string; name?: string }[]
+          listModels?(provider: string): Promise<{ id: string; name?: string }[]>
+        }
+      }).llm
+      if (request.method === 'GET') {
+        return json({
+          ok: true,
+          data: {
+            current: modelConfigOf(domain, config),
+            available: !!(llmSvc?.listModels),
+            providers: llmSvc?.listProviders?.() ?? [],
+          },
+        })
+      }
+      const body = await readJson<Record<string, unknown>>(request) ?? {}
+      const store: Record<string, unknown> = {}
+      for (const task of ['write', 'review', 'utility'] as const) {
+        const v = body[task]
+        if (v === undefined || v === null) continue
+        const ref = asModelRef(v)
+        if (!ref) return fail('INVALID_REQUEST', `${task} 需提供非空 provider/model`)
+        store[task] = ref
+      }
+      const cur = (domain.global.get() as Record<string, unknown>)[LLM_MODELS_KEY]
+      const base: Record<string, unknown> = cur && typeof cur === 'object' ? { ...cur as Record<string, unknown> } : {}
+      for (const task of ['write', 'review', 'utility'] as const) {
+        if (body[task] === null) delete base[task]
+        else if (store[task]) base[task] = store[task]
+      }
+      await domain.global.set({ ...(domain.global.get() as Record<string, unknown>), [LLM_MODELS_KEY]: base })
+      return json({ ok: true, data: { current: modelConfigOf(domain, config) } })
+    }),
+
+    // 模型目录：ctx 未注入 llm 时返回 available:false，前端退化为手填 provider/model。
+    route('/api/writer/llm/models', ['GET'], async (request) => {
+      const llmSvc = (ctx as unknown as { llm?: { listModels?(provider: string): Promise<{ id: string; name?: string }[]> } }).llm
+      const provider = queryOf(request).get('provider') ?? ''
+      if (!llmSvc?.listModels || !provider) return json({ ok: true, data: { available: false, models: [] } })
+      try {
+        const models = await llmSvc.listModels(provider)
+        return json({ ok: true, data: { available: true, models: models.map(m => ({ id: m.id, name: m.name ?? m.id })) } })
+      } catch (err) {
+        return json({ ok: true, data: { available: false, models: [], message: err instanceof Error ? err.message : String(err) } })
+      }
     }),
 
     // 导出：md（人读全稿）/ json（全量备份），附件下载（中文文件名 RFC 5987）。

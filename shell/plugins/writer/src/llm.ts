@@ -11,6 +11,7 @@ import {
   type Archetype,
 } from './style'
 import { GENERIC_FINGERPRINT, type QualityStats } from './quality'
+import type { ChapterContext } from './context.ts'
 
 /** LLM 失败信息（fail-closed：上层把它转成 SSE error 帧或 data.fail）。 */
 export interface LlmErrorInfo {
@@ -222,6 +223,7 @@ export function buildMoreBeatsPrompts(input: MoreBeatsInput): string {
     '规则：每 10 个 beat 里安排 1 个明确爽点（isCool=true）；每 30 个 1 个高潮（isClimax=true）。',
     '每个 beat 必须给 promise（本章给读者的承诺）与 uncertainty（本章新增的不确定点，形态多样：信息差/想要而得不到/两难/反常细节，不要全写成悬念）；适当时用 payoffOf 标注回收前文哪一章的 promise。每个 beat 的 hook 写清章末钩子（读者必须往下翻的理由）。',
     'JSON 结构：{"beats":[{"no":N,"title":"","beat":"本章发生什么(60-120字)","hook":"章末钩子","promise":"本章承诺","uncertainty":"本章新增不确定点","payoffOf":回收章号或省略,"isCool":false,"isClimax":false}]}',
+    'title 必须写成「第N章 标题」格式（N 与 no 一致，如 no=34 则 title=「第34章 残纸落款」）。',
     '',
     `书名：${input.bookName}（题材：${input.genre}）`,
     `一句话故事：${input.logline}`,
@@ -324,58 +326,19 @@ export interface ChapterPromptInput {
   uncertainty: string
   isCool: boolean
   targetWords: number
-  settings: AssembleSetting[]
-  /** 作者显式引用的设定名（编辑器「关联设定」标记，最高召回优先级）。 */
-  explicitRefs: string[]
-  memorySummary: string
-  /** 最近 3 章摘要（近→远或远→近均可，调用方排序）。 */
-  recentSummaries: { no: number; summary: string }[]
-  /** 上一章末尾原文（≤300 字）。 */
-  prevTail: string
-  /** 本章需回收的伏笔行。 */
-  dueForeshadows: string[]
   /** 黄金三章专项要求（第 1–3 章）。 */
   goldenRule: string
+  /** 分层检索产物（P0 必读 / P1 相关 / P2 背景 + 仅名称设定）。 */
+  context: ChapterContext
+  /** 上一稿质检问题（重写时逐条修复，可空）。 */
+  repairNotes?: string[]
 }
 
-/** 完整注入软预算（§11.4：超限按优先级截断，降级仅名称）。 */
-const ASSEMBLE_BUDGET = 4000
-
 /**
- * 组装单章 prompt。设定召回五级优先：显式引用 > 任务点名 > 主角团 >
- * 关键词命中 > 其余仅名称；stale 条目一律降级仅名称（带待复核标记）。
+ * 组装单章 prompt。上下文由 context.ts 分层检索后传入：
+ * P0 必读 / P1 相关 / P2 背景 / 仅名称，不再全量注入设定。
  */
 export function buildChapterPrompts(input: ChapterPromptInput): string {
-  const taskText = [input.beatText, input.hookText, input.promise, input.uncertainty].filter(Boolean).join('\n')
-
-  // 召回分级（数字越小越优先完整注入）
-  const tierOf = (se: AssembleSetting): number => {
-    if (input.explicitRefs.includes(se.name)) return 0
-    if (taskText.includes(se.name)) return 1
-    if (se.tags.includes('主角团')) return 2
-    if (se.tags.some(t => t.length >= 2 && taskText.includes(t))) return 3
-    return 4
-  }
-  const ordered = input.settings
-    .map((se, i) => ({ se, i, tier: tierOf(se) }))
-    .sort((a, b) => a.tier - b.tier || a.i - b.i)
-
-  let used = 0
-  const fullLines: string[] = []
-  const nameOnly: string[] = []
-  for (const { se, tier } of ordered) {
-    // 完整注入门槛：tier ≤ 3（其余仅名称）；stale 一律降级
-    if (tier <= 3 && !se.stale) {
-      const body = `${se.name}（${se.kind}）：${se.summary}${se.state ? `。当前状态：${se.state}` : ''}`
-      if (used + body.length <= ASSEMBLE_BUDGET) {
-        used += body.length
-        fullLines.push(`- ${body}`)
-        continue
-      }
-    }
-    nameOnly.push(se.stale ? `${se.name}（待复核，旧记录可能过时）` : se.name)
-  }
-
   const parts: string[] = []
   // 四层装配 1+2：写作教义（写什么）+ 风格原型（怎么写）
   parts.push(buildDoctrineBlock(input.archetype))
@@ -394,16 +357,17 @@ export function buildChapterPrompts(input: ChapterPromptInput): string {
   if (input.isCool) parts.push('本章是爽点章：必须给出明确的情绪爆点/打脸/收获，压—扬曲线在章内完成。')
   if (input.goldenRule) parts.push(input.goldenRule)
   parts.push('写法自检：第一段就要有事发生（入口即事件）；每 ~500 字回头检查是否制造了新的不确定（信息差/两难/反常/想要而得不到）；细节落到具体名词、精确数字、可感知动作上。')
-  parts.push(`目标字数：${input.targetWords} 字左右（2000–2800 之间）。`)
-  if (fullLines.length > 0) parts.push(`\n【设定装配（相关条目完整注入）】\n${fullLines.join('\n')}`)
-  if (nameOnly.length > 0) parts.push(`【其余已有设定（仅名称，如需提及请与前文一致）】${nameOnly.join('、')}`)
-  if (input.memorySummary) parts.push(`【前情·全局摘要】${input.memorySummary.slice(0, 300)}`)
-  if (input.recentSummaries.length > 0) {
-    parts.push('【前情·近章摘要】')
-    for (const s of input.recentSummaries) parts.push(`- 第 ${s.no} 章：${s.summary.slice(0, 200)}`)
+  parts.push(`目标字数：本章正文（含标点）不得低于 ${input.targetWords} 字，写到 ${input.targetWords}–${input.targetWords + 800} 字之间。字数不足视为任务未完成——用具体情节、动作与对话撑够篇幅，不要注水，也不要提前收束本章。`)
+  // 重写修复清单：只列问题，不重写无关段落
+  if (input.repairNotes && input.repairNotes.length > 0) {
+    parts.push('\n【上一稿质检问题（逐条修复，不要重写无关段落）】')
+    for (const line of input.repairNotes) parts.push(`- ${line}`)
   }
-  if (input.prevTail) parts.push(`【上一章末尾原文（衔接此内容续写）】\n${input.prevTail}`)
-  if (input.dueForeshadows.length > 0) parts.push(`【本章需回收的伏笔】\n${input.dueForeshadows.join('\n')}`)
+  // 分层上下文
+  if (input.context.p0.length > 0) parts.push(`\n【上下文·必读】\n${input.context.p0.map(i => i.text).join('\n')}`)
+  if (input.context.p1.length > 0) parts.push(`【上下文·相关】\n${input.context.p1.map(i => i.text).join('\n')}`)
+  if (input.context.p2.length > 0) parts.push(`【上下文·背景（仅作一致性参照，不要展开）】\n${input.context.p2.map(i => i.text).join('\n')}`)
+  if (input.context.nameOnly.length > 0) parts.push(`【其余已有设定（仅名称，如需提及请与前文一致）】${input.context.nameOnly.join('、')}`)
   // 四层装配 6：去 AI 味硬约束（阈值随原型指纹）
   parts.push(buildAiFlavorConstraints(input.archetype))
   parts.push([
@@ -454,6 +418,8 @@ export interface ReviewInput {
   /** 第一层程序闸结果：统计指纹 + 命中词表（AI 校准用，不要重复报同位置）。 */
   firstLayer: { stats: QualityStats; flavorHits: string[] }
   settings: ReviewSetting[]
+  /** 未完整注入的其余设定（仅名称，供一致性参照）。 */
+  otherSettingNames?: string[]
   /** 最近几章时间锚（供对照检测时间漂移），近章在前。 */
   recentTimelines: { no: number; anchors: ReviewAnchor[] }[]
   /** 最近几章摘要（供连续性参照），近章在前。 */
@@ -531,6 +497,9 @@ export function buildReviewPrompts(input: ReviewInput): string {
     for (const c of chars) {
       parts.push(`- ${c.name}：${c.summary.slice(0, 80)}${c.knownBy && c.knownBy.length > 0 ? `。已知道：${c.knownBy.join('；')}` : '。（无已知信息记录，谨慎判 KNOWLEDGE_LEAK）'}`)
     }
+  }
+  if (input.otherSettingNames && input.otherSettingNames.length > 0) {
+    parts.push(`\n【其余设定名称（未在正文出现，仅供一致性参照）】${input.otherSettingNames.join('、')}`)
   }
   if (input.recentSummaries.length > 0) {
     parts.push('\n【近章摘要（连续性参照）】')
@@ -726,4 +695,36 @@ export function parseFinalizeExtract(text: string): FinalizeExtract | null {
     }
   }
   return out
+}
+
+// ------------------------------------------------------------------
+// 全局滚动摘要压缩（plan ②）：旧摘要 + 本章摘要 → ≤300 字
+// ------------------------------------------------------------------
+
+export interface CompressSummaryInput {
+  oldSummary: string
+  newSummary: string
+  /** 压缩到的章号（写入 book.memoryThroughChapter）。 */
+  throughNo: number
+  targetChars?: number
+}
+
+/** 滚动摘要压缩 prompt：合并旧全局摘要与本章摘要，保留未回收线索。 */
+export function buildCompressSummaryPrompts(input: CompressSummaryInput): string {
+  const target = input.targetChars ?? 300
+  return [
+    '你是小说连载的记忆管理员。把「旧全局摘要」与「本章摘要」合并成一段新的滚动摘要。严格按 JSON 输出，不要输出任何其他文字。',
+    'JSON 结构：{"summary":"新的滚动摘要"}',
+    `规则：不超过 ${target} 字；保留主线进展、关键人物状态变化、尚未回收的伏笔；删除已完结的细节与重复表述；不要编造正文之外的信息。`,
+    '',
+    `旧全局摘要：${input.oldSummary.trim() || '（无）'}`,
+    `本章摘要（第 ${input.throughNo} 章）：${input.newSummary.trim()}`,
+  ].join('\n')
+}
+
+/** 解析压缩结果；summary 缺失返回 null（调用方 fail-soft 保留旧摘要）。 */
+export function parseCompressSummary(text: string): string | null {
+  const raw = parseJsonLoose<Record<string, unknown>>(text)
+  if (!raw || typeof raw['summary'] !== 'string' || !raw['summary'].trim()) return null
+  return raw['summary'].trim().slice(0, 400)
 }
