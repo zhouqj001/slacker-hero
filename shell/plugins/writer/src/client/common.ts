@@ -48,6 +48,8 @@ export interface WriterBook {
   fanqieVolumeId?: string
   chapterWords: number
   targetWords?: number
+  /** 全书规划总章数（立项时定，一键成书默认写到这个数）。 */
+  targetChapters?: number
   styleCard: string
   /** 风格原型 id（缺省 = 一期通用腔）。 */
   archetype?: string
@@ -182,6 +184,8 @@ export interface WizardProposal {
   volume: { title: string; summary: string }
   /** 按题材推荐的风格原型 id（确认建书时落 book.archetype）。 */
   archetype?: string
+  /** 全书规划总章数（立项规模，确认建书时落 book.targetChapters）。 */
+  totalChapters?: number
   beats: {
     no: number
     title: string
@@ -221,9 +225,16 @@ export interface QualityReport {
   stats: QualityStats
   hookOk?: boolean
   passed: boolean
+  /** 质量分级（新稿有；旧稿缺省时按 passed 回退）。 */
+  grade?: QualityGrade
+  /** 0–100 仅用于展示/排序，不参与放行判定。 */
+  score?: number
   /** LLM 审稿合并结果（/review 后挂上）。 */
   review?: ChapterReview
 }
+
+/** 质量分级：gold/silver 直接接受，bronze 定向重写，reject 跳过。 */
+export type QualityGrade = 'gold' | 'silver' | 'bronze' | 'reject'
 
 /** LLM 审稿 issue（evidence=原文依据 ≤60 字，suggestion=修改建议）。 */
 export interface ReviewIssue extends QualityIssue {
@@ -257,6 +268,10 @@ export interface WriterLog {
   ok: boolean
   ms: number
   issueCount?: number
+  /** 质量分级（generate/rewrite 阶段）。 */
+  grade?: string
+  /** 本次调用模型（provider/model）。 */
+  model?: string
   err?: string
   ts: number
 }
@@ -385,6 +400,24 @@ export async function postSse(
     body: JSON.stringify(body),
     signal,
   })
+  await readSse(res, onFrame)
+}
+
+/** GET SSE：接回常驻任务（刷新/断线后回放进度的场景用）。 */
+export async function getSse(
+  path: string,
+  onFrame: (frame: SseFrame) => boolean | void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(path, { signal })
+  await readSse(res, onFrame)
+}
+
+/** 逐帧读取 SSE 响应：按 \n\n 分帧，解析 data: JSON 后回调。 */
+async function readSse(
+  res: Response,
+  onFrame: (frame: SseFrame) => boolean | void,
+): Promise<void> {
   if (!res.ok || !res.body) throw new ApiError('HTTP_ERROR', `HTTP ${res.status}`)
   const reader = res.body.getReader()
   const dec = new TextDecoder()

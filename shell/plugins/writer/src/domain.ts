@@ -66,6 +66,8 @@ export const BookSchema = z.object({
   /** 单章目标字数（番茄口径 2200–2800，默认 2400）。 */
   chapterWords: z.number().int().positive().default(2400),
   targetWords: z.number().int().positive().optional(),
+  /** 全书规划总章数（立项讨论时定，一键成书默认写到这个数）。 */
+  targetChapters: z.number().int().positive().optional(),
   /** 文风卡（固定人设提示词，置顶注入所有生成）。 */
   styleCard: z.string(),
   /** 风格原型 id（style.ts ARCHETYPES 键，管「怎么写」；缺省 = 一期通用腔）。 */
@@ -84,6 +86,12 @@ export const BookSchema = z.object({
   }),
   /** 全局滚动摘要（定稿回写确认后更新，≤300 字）。 */
   memorySummary: z.string().default(''),
+  /** 全局摘要已压缩到的章号（plan ② 分层记忆游标）。 */
+  memoryThroughChapter: z.number().int().optional(),
+  /** 最近一次滚动摘要压缩时间。 */
+  memoryCompressedAt: z.number().optional(),
+  /** 摘要压缩失败/落后：前端提示，下次成书时补压。 */
+  memorySummaryStale: z.boolean().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
 })
@@ -244,6 +252,10 @@ export const LogSchema = z.object({
   tokens: z.number().int().optional(),
   ms: z.number().int(),
   issueCount: z.number().int().optional(),
+  /** 质量分级（generate/rewrite 阶段）。 */
+  grade: z.string().optional(),
+  /** 本次调用的模型（provider/model，按任务分模型后可见）。 */
+  model: z.string().optional(),
   err: z.string().optional(),
   ts: z.number(),
 })

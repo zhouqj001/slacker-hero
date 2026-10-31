@@ -441,6 +441,8 @@ interface BookRec {
   fanqieVolumeId?: string
   chapterWords: number
   targetWords?: number
+  /** 全书规划总章数（立项讨论时定，一键成书默认写到这个数）。 */
+  targetChapters?: number
   styleCard: string
   /** 风格原型 id（style.ts；缺省 = 一期通用腔）。 */
   archetype?: string
@@ -1301,6 +1303,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         styleCard?: string
         archetype?: string
         narrator?: string
+        targetChapters?: number
         outline?: {
           logline?: string
           coreConflict?: string
@@ -1333,6 +1336,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
         status: 'planning',
         chapterWords: body.chapterWords && body.chapterWords > 0 ? Math.floor(body.chapterWords) : 2400,
         targetWords: body.targetWords && body.targetWords > 0 ? Math.floor(body.targetWords) : undefined,
+        targetChapters: body.targetChapters && body.targetChapters > 0 ? Math.floor(body.targetChapters) : undefined,
         styleCard: body.styleCard?.trim() || DEFAULT_STYLE_CARD,
         archetype: parseArchetypeId(body.archetype),
         narrator: body.narrator?.trim() || undefined,
@@ -1402,6 +1406,7 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
           status?: 'planning' | 'writing' | 'finished'
           chapterWords?: number
           targetWords?: number | null
+          targetChapters?: number | null
           styleCard?: string
           archetype?: string | null
           narrator?: string
@@ -1432,6 +1437,9 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
       if (typeof patch.chapterWords === 'number' && patch.chapterWords > 0) next.chapterWords = Math.floor(patch.chapterWords)
       if (patch.targetWords === null) next.targetWords = undefined
       else if (typeof patch.targetWords === 'number' && patch.targetWords > 0) next.targetWords = Math.floor(patch.targetWords)
+      // 全书规划总章数：null 清除；正数更新
+      if (patch.targetChapters === null) next.targetChapters = undefined
+      else if (typeof patch.targetChapters === 'number' && patch.targetChapters > 0) next.targetChapters = Math.floor(patch.targetChapters)
       if (patch.styleCard?.trim()) next.styleCard = patch.styleCard
       // 原型：null/'' 清除（回通用腔）；非法 id 忽略
       if (patch.archetype === null || patch.archetype === '') next.archetype = undefined

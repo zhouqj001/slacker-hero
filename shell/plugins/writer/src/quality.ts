@@ -26,6 +26,27 @@ export interface QualityStats {
   parallelismRuns: number
 }
 
+/** 质量分级（plan §4.2 分级门禁）：gold/silver 直接接受，bronze 定向重写，reject 重写后仍不合格则跳过。 */
+export type QualityGrade = 'gold' | 'silver' | 'bronze' | 'reject'
+
+/** 分级策略（重写预算与是否接受）。 */
+export interface GradePolicy {
+  maxRewrites: number
+  accept: boolean
+  reason: string
+}
+
+/** 各分级默认策略：gold/silver 0 次重写；bronze 1 次；reject 2 次后仍 reject 则跳过。 */
+export const GRADE_POLICIES: Record<QualityGrade, GradePolicy> = {
+  gold: { maxRewrites: 0, accept: true, reason: '无阻断、无提醒，字数与章末钩子达标' },
+  silver: { maxRewrites: 0, accept: true, reason: '无阻断，提醒不超过 2 条' },
+  bronze: { maxRewrites: 1, accept: true, reason: '无阻断但提醒较多，定向重写 1 次' },
+  reject: { maxRewrites: 2, accept: false, reason: '存在阻断问题或提醒过多，重写后仍不合格则跳过' },
+}
+
+/** 分级排序（用于 minGrade 比较，越大越好）。 */
+export const GRADE_RANK: Record<QualityGrade, number> = { reject: 0, bronze: 1, silver: 2, gold: 3 }
+
 export interface QualityReport {
   /** 有效字数（去空白）。 */
   words: number
@@ -35,8 +56,32 @@ export interface QualityReport {
   stats: QualityStats
   /** 模型自评的结尾钩子（缺失 = undefined）。 */
   hookOk?: boolean
-  /** 有 block 级问题 → false。 */
+  /** 有 block 级问题 → false（保留旧字段语义，等价于 grade !== 'reject'）。 */
   passed: boolean
+  /** 质量分级（分级门禁据此决定返工与接受）。 */
+  grade: QualityGrade
+  /** 0–100，仅用于排序/展示，不参与放行判定。 */
+  score: number
+}
+
+/**
+ * 按第一层统计计算分级（纯函数，零 LLM）。
+ * block → reject；warn 0 且字数 2000–3000 且钩子达标 → gold；warn ≤2 → silver；
+ * warn 3–4 → bronze；warn ≥5 → reject。
+ */
+function gradeOf(issues: QualityIssue[], words: number, hookOk: boolean | undefined): QualityGrade {
+  if (issues.some(i => i.level === 'block')) return 'reject'
+  const warns = issues.filter(i => i.level === 'warn').length
+  if (warns === 0 && words >= 2000 && words <= 3000 && hookOk === true) return 'gold'
+  if (warns <= 2) return 'silver'
+  if (warns <= 4) return 'bronze'
+  return 'reject'
+}
+
+/** 展示用分数：每 warn −15、每 block −50，info 不扣分。 */
+function scoreOf(issues: QualityIssue[]): number {
+  const penalty = issues.reduce((n, i) => n + (i.level === 'block' ? 50 : i.level === 'warn' ? 15 : 0), 0)
+  return Math.max(0, 100 - penalty)
 }
 
 /** 平台硬线：番茄正文 ≥1000 字。 */
@@ -239,6 +284,8 @@ export function analyzeChapter(
     issues,
     stats: { sentenceStd, paraCv, sublimationParas, parallelismRuns },
     hookOk: opts.hookOk,
-    passed: !issues.some(i => i.level === 'block'),
+    passed: gradeOf(issues, words, opts.hookOk) !== 'reject',
+    grade: gradeOf(issues, words, opts.hookOk),
+    score: scoreOf(issues),
   }
 }

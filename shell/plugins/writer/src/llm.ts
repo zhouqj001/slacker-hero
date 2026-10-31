@@ -108,6 +108,8 @@ export interface WizardProposal {
   volume: { title: string; summary: string }
   /** 按题材推荐的风格原型 id（确认建书时落 book.archetype）。 */
   archetype?: string
+  /** 全书规划总章数（立项规模，确认建书时落 book.targetChapters）。 */
+  totalChapters?: number
   beats: BeatDraft[]
 }
 
@@ -125,8 +127,9 @@ export function buildWizardPrompts(input: WizardInput): string {
     '- 每个 beat 的 hook 字段写清章末钩子（让读者必须往下翻的理由）。',
     '- archetype：按题材从内置原型库选一个最合适的（sharp-tongue=毒舌老炮体，都市/现实向；deadpan=白描冷面体，悬疑/正剧；chatter=生活流唠嗑体，轻喜剧/日常）。',
     '- beat.no 从 1 连续递增；标题不超过 12 字。',
+    '- totalChapters：全书规划总章数（立项规模就定死，连载体量感，60–300 取整；短篇题材可低至 40）。同时让 volume.summary 末尾注明「本卷预计写到第 X 章」。',
     'JSON 结构：',
-    '{"names":["书名候选x5"],"archetype":"sharp-tongue","intro":"简介","protagonist":{"name":"主角名","summary":"主角与核心金手指速写(80-150字)","tags":["主角团","其他标签"]},"outline":{"logline":"一句话故事","coreConflict":"核心矛盾"},"volume":{"title":"第一卷标题","summary":"第一卷卷纲摘要(100-200字)"},"beats":[{"no":1,"title":"","beat":"本章发生什么(60-120字)","hook":"章末钩子","promise":"本章承诺","uncertainty":"本章新增不确定点","isCool":false,"isClimax":false}]}',
+    '{"names":["书名候选x5"],"archetype":"sharp-tongue","totalChapters":120,"intro":"简介","protagonist":{"name":"主角名","summary":"主角与核心金手指速写(80-150字)","tags":["主角团","其他标签"]},"outline":{"logline":"一句话故事","coreConflict":"核心矛盾"},"volume":{"title":"第一卷标题","summary":"第一卷卷纲摘要(100-200字)"},"beats":[{"no":1,"title":"","beat":"本章发生什么(60-120字)","hook":"章末钩子","promise":"本章承诺","uncertainty":"本章新增不确定点","isCool":false,"isClimax":false}]}',
     '',
     `题材：${input.genre}`,
     `一句话点子：${input.idea}`,
@@ -184,6 +187,7 @@ export function parseWizardProposal(text: string): WizardProposal | null {
   return {
     names: names.filter((n): n is string => typeof n === 'string').slice(0, 5),
     archetype: parseArchetypeId(raw['archetype']),
+    totalChapters: typeof raw['totalChapters'] === 'number' && raw['totalChapters'] >= 1 ? Math.floor(raw['totalChapters']) : undefined,
     intro,
     protagonist: {
       name: protagonist['name'],

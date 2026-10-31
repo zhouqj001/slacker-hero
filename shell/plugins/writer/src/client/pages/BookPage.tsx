@@ -811,7 +811,15 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                 <button
                   className={s.btn}
                   disabled={gen != null || bookBusy}
-                  onClick={() => setBookConfirm(true)}
+                  onClick={() => {
+                    // 预填：从已写最大章+1 接着写；终点优先用立项规划的总章数，无规划则 +99
+                    const maxNo = book?.outline.beats.reduce((m, b) => Math.max(m, b.no), 0) ?? 0
+                    const from = Math.min(maxNo + 1, 300)
+                    const planned = book?.targetChapters ?? 0
+                    setBookFrom(from)
+                    setBookTarget(Math.min(Math.max(planned > from ? planned : from + 99, from), 300))
+                    setBookConfirm(true)
+                  }}
                 >一键成书</button>
               </div>
               {bookRun && (bookRun.phase === 'run' ? (
@@ -1354,6 +1362,9 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                 />
                 <span>章</span>
               </div>
+              {book?.targetChapters ? (
+                <div className={s.tiny}>立项规划：全书 {book.targetChapters} 章（约 {Math.round(book.targetChapters * book.chapterWords / 10000)} 万字）；单次最多 300 章，超出请分段跑。</div>
+              ) : null}
               <div className={s.tiny}>
                 区间内已定稿的章自动跳过，只写缺的部分；缺纲自动续排，逐章生成并质检重试，定稿回写后记忆自动入册。中途可随时停止，下次接着写。
               </div>

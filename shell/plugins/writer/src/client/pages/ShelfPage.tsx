@@ -45,6 +45,8 @@ interface ProposalDraft {
   intro: string
   chapterWords: number
   targetWords: number
+  /** 全书规划总章数（立项规模，向导提案，可改）。 */
+  targetChapters: number
   styleCard: string
   /** 风格原型 id（向导推荐，可换；'' = 一期通用腔）。 */
   archetype: string
@@ -117,6 +119,7 @@ export function ShelfPage({ accounts, onOpen, showToast }: ShelfPageProps): JSX.
             intro: proposal.intro,
             chapterWords: 2400,
             targetWords: 0,
+            targetChapters: proposal.totalChapters ?? 120,
             styleCard: DEFAULT_STYLE_CARD,
             archetype: proposal.archetype ?? '',
           })
@@ -148,6 +151,7 @@ export function ShelfPage({ accounts, onOpen, showToast }: ShelfPageProps): JSX.
         intro: draft.intro,
         chapterWords: draft.chapterWords,
         targetWords: draft.targetWords > 0 ? draft.targetWords : undefined,
+        targetChapters: draft.targetChapters > 0 ? draft.targetChapters : undefined,
         styleCard: draft.styleCard,
         archetype: draft.archetype || undefined,
         outline: {
@@ -373,6 +377,16 @@ export function ShelfPage({ accounts, onOpen, showToast }: ShelfPageProps): JSX.
                 />
               </Field>
               <div className={s.row}>
+                <Field label="全书规划（章）">
+                  <input
+                    className={s.input}
+                    type="number"
+                    min={1}
+                    max={2000}
+                    value={draft.targetChapters || ''}
+                    onChange={e => setDraft({ ...draft, targetChapters: Number(e.target.value) || 0 })}
+                  />
+                </Field>
                 <Field label="章均字数">
                   <input
                     className={s.input}
