@@ -210,6 +210,14 @@ export interface QualityIssue {
   message: string
 }
 
+/** 全书体检 issue（LENGTH 仅程序侧产出）。 */
+export interface InspectIssue {
+  severity: 'high' | 'mid' | 'low'
+  type: 'CONTINUITY' | 'TIMELINE' | 'CHARACTER' | 'FORESHADOW' | 'STYLE' | 'LENGTH'
+  message: string
+  evidence?: string
+}
+
 /** 粗筛统计项（句长方差等；质检报告与审稿校准共用）。 */
 export interface QualityStats {
   sentenceStd: number
@@ -506,6 +514,23 @@ export const SETTING_KIND_LABEL: Record<string, string> = {
   item: '物品',
   faction: '阵营',
   relation: '关系',
+}
+
+/** 全书体检 issue 类型中文标签。 */
+export const INSPECT_TYPE_LABEL: Record<InspectIssue['type'], string> = {
+  CONTINUITY: '情节矛盾',
+  TIMELINE: '时间线',
+  CHARACTER: '人设冲突',
+  FORESHADOW: '伏笔',
+  STYLE: '文风漂移',
+  LENGTH: '字数偏短',
+}
+
+/** 全书体检严重度标签。 */
+export const INSPECT_SEVERITY_LABEL: Record<InspectIssue['severity'], string> = {
+  high: '严重',
+  mid: '疑似',
+  low: '轻微',
 }
 
 export const PENDING_KIND_LABEL: Record<string, string> = {

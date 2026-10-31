@@ -21,6 +21,7 @@ import {
   buildChapterPrompts,
   buildCompressSummaryPrompts,
   buildFinalizePrompts,
+  buildInspectPrompts,
   buildMoreBeatsPrompts,
   buildNewVolumePrompts,
   buildReviewPrompts,
@@ -29,6 +30,7 @@ import {
   parseBeatsProposal,
   parseCompressSummary,
   parseFinalizeExtract,
+  parseInspectResult,
   parseReviewResult,
   parseWizardProposal,
   resolveLlmError,
@@ -2151,6 +2153,104 @@ export function writerRoutes(domain: WriterDomain, ctx: Context, config: WriterC
       await chapters.put(ch.id, { ...ch, quality, updatedAt: reviewedAt })
       void writeLog(domain, { bookId: book.id, no, stage: 'review', ok: true, ms: reviewedAt - t0, issueCount: review.issues.length, model: result.model ?? modelLabel(resolveModelRef('review', domain, config)) })
       return json({ ok: true, data: { review: { ...review, blockCount, warnCount, reviewedAt }, quality, sessionId: result.sessionId, baseline: result.baseline } })
+    }),
+
+    // ---------------- 全书体检（跨章一致性快检，只读） ----------------
+
+    // 逐章快检「与前文/设定的矛盾」（人设/时间线/情节/伏笔/文风漂移）+ 程序侧免费检查
+    // （字数明显偏短），SSE 进度。只读不写库，断线即弃（重跑只耗额度）；LLM 上下文：
+    // 设定面 + 近 3 章摘要/时间锚 + 未回收伏笔账。
+    route('/api/writer/inspect/book', ['POST'], async (request) => {
+      const body = await readJson<{ bookId?: string; from?: number; to?: number }>(request) ?? {}
+      const book = getBook(domain, body.bookId)
+      const maxNo = book.outline.beats.reduce((m, b) => Math.max(m, b.no), 0)
+      const from = Math.min(Math.max(Math.floor(body.from ?? 1), 1), Math.max(maxNo, 1))
+      const to = Math.min(Math.max(Math.floor(body.to ?? maxNo), from), Math.max(maxNo, 1))
+      // 待检章：已定稿且有正文（drafted 章还没定稿，随时可能重写，不检）
+      const nos: number[] = []
+      for (let n = from; n <= to; n++) {
+        const beat = book.outline.beats.find(b => b.no === n)
+        if (beat?.status !== 'finalized') continue
+        const ch = getChapter(domain, book.id, n)
+        if (ch && ch.content.trim() !== '') nos.push(n)
+      }
+      // 未回收伏笔账（一次取，逐章注入；逾期未回收的汇总在 done 帧单独给前端展示）
+      const openFores = [...domain.table('foreshadow').entries()]
+        .map(([, v]) => v as { bookId: string; desc: string; plantedAt: number; suggestPayoffAt?: number; paidAt?: number })
+        .filter(f => f.bookId === book.id && !f.paidAt)
+      const staleFores = openFores.filter(f => f.suggestPayoffAt != null && f.suggestPayoffAt < to)
+      const allSettings = settingsOf(domain, book.id)
+      const stream = new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder()
+          let closed = false
+          const send = (data: object): void => {
+            if (closed) return
+            try { controller.enqueue(enc.encode(sseEvent(data))) } catch { /* 流已断 */ }
+          }
+          const ping = setInterval(() => send({ type: 'ping', ts: Date.now() }), 15000)
+          try {
+            send({ type: 'plan', total: nos.length, from, to, staleCount: staleFores.length })
+            let issueTotal = 0
+            let inspected = 0
+            for (const no of nos) {
+              if (request.signal.aborted) break
+              send({ type: 'chapter/start', no, index: inspected + 1 })
+              const ch = getChapter(domain, book.id, no)
+              if (!ch) continue
+              const recentTimelines: { no: number; anchors: NonNullable<ChapterRec['timeline']> }[] = []
+              const recentSummaries: { no: number; summary: string }[] = []
+              for (let i = no - 1; i >= Math.max(1, no - 3); i--) {
+                const prev = getChapter(domain, book.id, i)
+                if (!prev) continue
+                if (prev.timeline && prev.timeline.length > 0) recentTimelines.push({ no: i, anchors: prev.timeline })
+                if (prev.summary && prev.summary.trim() !== '') recentSummaries.push({ no: i, summary: prev.summary })
+              }
+              const reviewCtx = buildReviewContext({ content: ch.content, settings: allSettings })
+              const t0 = Date.now()
+              const result = await askSession(sessionCtrl(), {
+                title: `体检：第${no}章`,
+                prompt: buildInspectPrompts({
+                  bookName: book.name,
+                  chapterNo: no,
+                  chapterTitle: ch.title,
+                  content: ch.content,
+                  settings: reviewCtx.settings.map(s => ({ kind: s.kind, name: s.name, summary: s.summary, knownBy: s.knownBy })),
+                  recentSummaries,
+                  recentTimelines,
+                  openForeshadows: openFores.map(f => ({ desc: f.desc, plantedAt: f.plantedAt, suggestPayoffAt: f.suggestPayoffAt })),
+                }),
+                signal: request.signal,
+                task: 'review',
+                selection: resolveModelRef('review', domain, config),
+              })
+              const issues = result.failure ? [] : parseInspectResult(result.text)
+              // 程序侧免费检查：字数明显偏短（与批量成书的质量闸同口径）
+              const words = ch.content.replace(/\s/g, '').length
+              if (words < Math.max(200, Math.floor(book.chapterWords * 0.55))) {
+                issues.push({ severity: 'mid', type: 'LENGTH', message: `本章仅 ${words} 字，低于目标章字数（${book.chapterWords} 字）的 55%，疑似烂尾章` })
+              }
+              issueTotal += issues.length
+              inspected++
+              void writeLog(domain, { bookId: book.id, no, stage: 'review', ok: !result.failure, ms: Date.now() - t0, issueCount: issues.length, err: result.failure?.code, model: result.model ?? modelLabel(resolveModelRef('review', domain, config)) })
+              send({ type: 'chapter/done', no, issues })
+            }
+            send({
+              type: 'done',
+              inspected,
+              issues: issueTotal,
+              staleForeshadows: staleFores.map(f => ({ desc: f.desc, plantedAt: f.plantedAt, suggestPayoffAt: f.suggestPayoffAt })),
+            })
+          } catch (err) {
+            send({ type: 'error', code: 'SERVER', message: err instanceof Error ? err.message : String(err) })
+          } finally {
+            clearInterval(ping)
+            closed = true
+            controller.close()
+          }
+        },
+      })
+      return sseResponse(stream)
     }),
 
     // ---------------- 支撑面：日志 / 导出 / 作者档案（二期 §11.6/§11.7）----------------

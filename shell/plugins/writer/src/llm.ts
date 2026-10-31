@@ -569,6 +569,103 @@ export function parseReviewResult(text: string): ReviewResult {
 }
 
 // ------------------------------------------------------------------
+// 全书体检（跨章一致性快检：与单章审稿互补，只报跨章矛盾）
+// ------------------------------------------------------------------
+
+/** 全书体检单章输入：章文 + 精简上下文（设定面/近章摘要/时间锚/未回收伏笔）。 */
+export interface InspectInput {
+  bookName: string
+  chapterNo: number
+  chapterTitle: string
+  content: string
+  settings: { kind: string; name: string; summary: string; knownBy?: string[] }[]
+  recentSummaries: { no: number; summary: string }[]
+  recentTimelines: { no: number; anchors: ReviewAnchor[] }[]
+  openForeshadows: { desc: string; plantedAt: number; suggestPayoffAt?: number }[]
+}
+
+/** 体检 issue（type 中文标签由前端映射；LENGTH 仅程序侧产出）。 */
+export interface InspectIssue {
+  severity: 'high' | 'mid' | 'low'
+  type: 'CONTINUITY' | 'TIMELINE' | 'CHARACTER' | 'FORESHADOW' | 'STYLE' | 'LENGTH'
+  message: string
+  /** 本章正文逐字摘录（≤60 字）。 */
+  evidence?: string
+}
+
+/** 全书体检 prompt：快检口径——宁缺毋滥，只报有依据的跨章矛盾，不报文风细节与剧情建议。 */
+export function buildInspectPrompts(input: InspectInput): string {
+  const parts: string[] = []
+  parts.push([
+    `你是连载小说《${input.bookName}》的连续性审校，对给定章节做跨章一致性快检，输出 JSON（无问题输出 {"issues":[]}），不要输出任何其他文字。`,
+    '',
+    '只报「有本章原文或前文/设定依据的确定问题」，宁缺毋滥：不报文风细节、不报剧情建议、不报单章内的表达问题（那是审稿编辑的事）。',
+    '类型：',
+    '- CHARACTER：人物姓名/称谓/关系/能力与人设前后矛盾（对照设定集与前文摘要）',
+    '- TIMELINE：时间线硬矛盾（昼夜/时长/先后对不上，对照近章时间锚）',
+    '- CONTINUITY：情节/物品/位置与前文矛盾（如上一章明确在 A 地、本章无交代出现在 B 地）',
+    '- FORESHADOW：本章明显应当回收的伏笔被遗忘（对照未回收伏笔账，仅在情节点明确对应时才报）',
+    '- STYLE：明显文风漂移（人称突变/叙述视角跳跃，而非措辞差异）',
+    '严重度：high=硬矛盾（必须改）；mid=疑似矛盾（需作者复核）；low=轻微瑕疵。',
+    '',
+    '硬规则：每条 issue 必须带 evidence（从本章正文逐字摘录 ≤60 字），message 说清与哪一章或哪条设定矛盾；给不出依据就不要报。',
+    'JSON 结构：',
+    '{"issues":[{"severity":"high|mid|low","type":"CHARACTER|TIMELINE|CONTINUITY|FORESHADOW|STYLE","message":"问题描述（指明矛盾对象）","evidence":"原文逐字摘录≤60字"}]}',
+  ].join('\n'))
+  if (input.settings.length > 0) {
+    parts.push('\n【设定集】')
+    for (const s of input.settings.slice(0, 12)) {
+      parts.push(`- [${s.kind}] ${s.name}：${s.summary.slice(0, 100)}${s.knownBy && s.knownBy.length > 0 ? `。已知道：${s.knownBy.join('；')}` : ''}`)
+    }
+  }
+  if (input.recentSummaries.length > 0) {
+    parts.push('\n【近章摘要（近章在前）】')
+    for (const s of input.recentSummaries) parts.push(`- 第 ${s.no} 章：${s.summary.slice(0, 150)}`)
+  }
+  if (input.recentTimelines.length > 0) {
+    parts.push('\n【近章时间锚（近章在前）】')
+    for (const t of input.recentTimelines) {
+      const lines = t.anchors.map(a => `  - ${a.scene ? `${a.scene}：` : ''}开始=${a.start}；间隔=${a.gap}；时长=${a.duration}；结束=${a.end}`)
+      parts.push(`第 ${t.no} 章：\n${lines.join('\n')}`)
+    }
+  }
+  if (input.openForeshadows.length > 0) {
+    parts.push('\n【未回收伏笔账】')
+    for (const f of input.openForeshadows.slice(0, 20)) {
+      parts.push(`- 第 ${f.plantedAt} 章埋下：${f.desc.slice(0, 80)}${f.suggestPayoffAt ? `（建议第 ${f.suggestPayoffAt} 章前后回收）` : ''}`)
+    }
+  }
+  parts.push(`\n第 ${input.chapterNo} 章《${input.chapterTitle}》正文：`)
+  parts.push(input.content)
+  return parts.join('\n')
+}
+
+const INSPECT_SEVERITIES = ['high', 'mid', 'low'] as const
+const INSPECT_TYPES = ['CONTINUITY', 'TIMELINE', 'CHARACTER', 'FORESHADOW', 'STYLE'] as const
+
+/** 解析体检结果（fail-open：结构异常按无问题处理，不阻塞批量体检）。 */
+export function parseInspectResult(text: string): InspectIssue[] {
+  const raw = parseJsonLoose<Record<string, unknown>>(text)
+  if (!raw || !Array.isArray(raw['issues'])) return []
+  const out: InspectIssue[] = []
+  for (const it of raw['issues']) {
+    const rec = it as Record<string, unknown>
+    if (typeof rec['message'] !== 'string' || !rec['message'].trim()) continue
+    const sev = typeof rec['severity'] === 'string' && (INSPECT_SEVERITIES as readonly string[]).includes(rec['severity'])
+      ? rec['severity'] as InspectIssue['severity'] : 'mid'
+    const type = typeof rec['type'] === 'string' && (INSPECT_TYPES as readonly string[]).includes(rec['type'])
+      ? rec['type'] as InspectIssue['type'] : 'CONTINUITY'
+    out.push({
+      severity: sev,
+      type,
+      message: rec['message'].slice(0, 300),
+      evidence: typeof rec['evidence'] === 'string' && rec['evidence'].trim() ? rec['evidence'].slice(0, 60) : undefined,
+    })
+  }
+  return out
+}
+
+// ------------------------------------------------------------------
 // 定稿回写：一次 askSession 提取结构化记忆（plan §4.2 + §11.4 出处/时间锚）
 // ------------------------------------------------------------------
 

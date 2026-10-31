@@ -11,6 +11,7 @@ import type {
   Chapter,
   ChapterListItem,
   ChapterReview,
+  InspectIssue,
   PendingRec,
   QualityGrade,
   QualityReport,
@@ -20,6 +21,8 @@ import type {
 } from '../common.ts'
 import {
   BEAT_STATUS_LABEL,
+  INSPECT_SEVERITY_LABEL,
+  INSPECT_TYPE_LABEL,
   LOG_STAGE_LABEL,
   PENDING_KIND_LABEL,
   PUBLISH_STATE_LABEL,
@@ -88,6 +91,17 @@ interface BookRunState {
   message: string
   phase: 'run' | 'done'
   finished: boolean
+}
+
+/** 全书体检的前端进度态。 */
+interface InspectRunState {
+  total: number
+  inspected: number
+  issues: number
+  message: string
+  phase: 'run' | 'done'
+  /** 完成后的按章分组问题（报告关闭后可从进度框重开）。 */
+  report: { no: number; issues: InspectIssue[] }[]
 }
 
 /** 按任务分模型（plan ③）三档。 */
@@ -159,6 +173,14 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
   const [bookRun, setBookRun] = useState<BookRunState | null>(null)
   const bookAbort = useRef<AbortController | null>(null)
 
+  // ── 全书体检（只读快检，与批量成书互斥） ──
+  const [inspectConfirm, setInspectConfirm] = useState(false)
+  const inspectAbort = useRef<AbortController | null>(null)
+  const [inspectRun, setInspectRun] = useState<InspectRunState | null>(null)
+  // 体检报告：按章分组的 issue 列表 + 伏笔账逾期提醒；null = 不展示
+  const [inspectReport, setInspectReport] = useState<{ no: number; issues: InspectIssue[] }[] | null>(null)
+  const [staleFores, setStaleFores] = useState<{ desc: string; plantedAt: number; suggestPayoffAt?: number }[]>([])
+
   // ── 日志 ──
   const [logs, setLogs] = useState<WriterLog[]>([])
   const logsLoaded = useRef(false)
@@ -193,6 +215,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
       genAbort.current?.abort()
       beatsAbort.current?.abort()
       bookAbort.current?.abort()
+      inspectAbort.current?.abort()
     }
   }, [reloadChapters, reloadDetail])
 
@@ -594,6 +617,67 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
     void apiPost('/api/writer/generate/book/stop', { bookId }).catch(err => showToast(errMsg(err), true))
   }, [bookId, showToast])
 
+  // ── 全书体检 ──
+
+  /** 全书体检：逐章跨章一致性快检（只读，不写库），完成后弹报告。 */
+  const startInspect = useCallback(() => {
+    if (bookRun?.phase === 'run' || gen) {
+      showToast('正在写作中，请先完成再体检', true)
+      return
+    }
+    inspectAbort.current?.abort()
+    const ctrl = new AbortController()
+    inspectAbort.current = ctrl
+    const results: { no: number; issues: InspectIssue[] }[] = []
+    setInspectReport(null)
+    setStaleFores([])
+    setInspectRun({ total: 0, inspected: 0, issues: 0, message: '正在准备…', phase: 'run', report: [] })
+    void postSse('/api/writer/inspect/book', { bookId }, frame => {
+      if (frame['type'] === 'plan') {
+        const total = frameNum(frame, 'total') ?? 0
+        setInspectRun({ total, inspected: 0, issues: 0, message: total > 0 ? `共 ${total} 章待检…` : '没有已定稿的章可检', phase: 'run', report: [] })
+        if (total === 0) return true
+        return false
+      }
+      if (frame['type'] === 'chapter/start') {
+        const no = frameNum(frame, 'no') ?? 0
+        setInspectRun(r => r ? { ...r, message: `正在体检第 ${no} 章…` } : r)
+        return false
+      }
+      if (frame['type'] === 'chapter/done') {
+        const no = frameNum(frame, 'no') ?? 0
+        const issues = frameObj<InspectIssue[]>(frame, 'issues') ?? []
+        if (issues.length > 0) results.push({ no, issues })
+        setInspectRun(r => r ? { ...r, inspected: r.inspected + 1, issues: r.issues + issues.length, message: `第 ${no} 章完成，累计 ${r.issues + issues.length} 个问题` } : r)
+        return false
+      }
+      if (frame['type'] === 'done') {
+        const inspected = frameNum(frame, 'inspected') ?? 0
+        const issueTotal = frameNum(frame, 'issues') ?? 0
+        setStaleFores(frameObj<{ desc: string; plantedAt: number; suggestPayoffAt?: number }[]>(frame, 'staleForeshadows') ?? [])
+        const report = [...results].sort((a, b) => a.no - b.no)
+        setInspectRun({ total: inspected, inspected, issues: issueTotal, message: `体检完成：${inspected} 章共 ${issueTotal} 个问题`, phase: 'done', report })
+        if (issueTotal > 0) setInspectReport(report)
+        return true
+      }
+      if (frame['type'] === 'error') {
+        setInspectRun(r => r ? { ...r, phase: 'done', message: `体检失败：${frameStr(frame, 'message') || '服务错误'}` } : r)
+        return true
+      }
+      return false
+    }, ctrl.signal).catch(err => {
+      if (!ctrl.signal.aborted) {
+        setInspectRun(r => r ? { ...r, phase: 'done', message: `连接中断：${errMsg(err)}` } : r)
+      }
+    })
+  }, [bookId, bookRun, gen, showToast])
+
+  /** 体检只读，直接断开即可（服务端随请求中止）。 */
+  const stopInspect = useCallback(() => {
+    inspectAbort.current?.abort()
+    setInspectRun(r => r ? { ...r, phase: 'done', message: '体检已停止' } : r)
+  }, [])
+
   /** LLM 审稿：合并 AI 味 / 不确定密度 / 连续性，一次同步调用。 */
   const reviewChapter = useCallback(async () => {
     if (selNo == null || content.trim() === '') return
@@ -741,6 +825,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
 
   const pendingBeatNo = book.outline.beats.find(b => b.status === 'pending')?.no ?? null
   const bookBusy = bookRun != null && bookRun.phase === 'run'
+  const inspectBusy = inspectRun != null && inspectRun.phase === 'run'
 
   /** 待确认条目正文的纯文本渲染。 */
   const pendingBody = (p: PendingRec): string => {
@@ -801,7 +886,7 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
               <div className={s.row}>
                 <button
                   className={s.btnPrimary}
-                  disabled={gen != null || bookBusy}
+                  disabled={gen != null || bookBusy || inspectBusy}
                   onClick={() => {
                     if (pendingBeatNo == null) { showToast('没有待写的章纲，请到「大纲」页续排', true); return }
                     genChapter(pendingBeatNo)
@@ -810,7 +895,12 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                 <span className={s.spacer} />
                 <button
                   className={s.btn}
-                  disabled={gen != null || bookBusy}
+                  disabled={gen != null || bookBusy || inspectBusy}
+                  onClick={() => setInspectConfirm(true)}
+                >全书体检</button>
+                <button
+                  className={s.btn}
+                  disabled={gen != null || bookBusy || inspectBusy}
                   onClick={() => {
                     // 预填：从已写最大章+1 接着写；终点优先用立项规划的总章数，无规划则 +99
                     const maxNo = book?.outline.beats.reduce((m, b) => Math.max(m, b.no), 0) ?? 0
@@ -845,6 +935,32 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
                   <div className={s.row}>
                     <span className={s.spacer} />
                     <button className={s.btnSm} onClick={() => setBookRun(null)}>知道了</button>
+                  </div>
+                </div>
+              ))}
+              {inspectRun && (inspectRun.phase === 'run' ? (
+                <div className={s.runBox}>
+                  <div className={s.row}>
+                    <span className={s.genDot} />
+                    <span className={`${s.grow} ${s.ellipsis}`}>{inspectRun.message}</span>
+                  </div>
+                  {inspectRun.total > 0 && (
+                    <div className={s.tiny}>已检 {inspectRun.inspected}/{inspectRun.total} 章 · 发现 {inspectRun.issues} 个问题</div>
+                  )}
+                  <div className={s.row}>
+                    <span className={s.spacer} />
+                    <button className={s.btnSm} onClick={stopInspect}>停止</button>
+                  </div>
+                </div>
+              ) : (
+                <div className={s.runBox}>
+                  <div className={/体检失败|连接中断/.test(inspectRun.message) ? s.errorText : undefined}>{inspectRun.message}</div>
+                  <div className={s.row}>
+                    <span className={s.spacer} />
+                    {inspectRun.report.length > 0 && (
+                      <button className={s.btnSm} onClick={() => setInspectReport(inspectRun.report)}>查看报告</button>
+                    )}
+                    <button className={s.btnSm} onClick={() => setInspectRun(null)}>知道了</button>
                   </div>
                 </div>
               ))}
@@ -1374,6 +1490,64 @@ export function BookPage({ bookId, accounts, showToast, onBack }: BookPageProps)
           onConfirm={() => { setBookConfirm(false); startBookRun(bookFrom, bookTarget) }}
           onCancel={() => setBookConfirm(false)}
         />
+      )}
+
+      {/* 全书体检：开始前确认 */}
+      {inspectConfirm && (
+        <ConfirmModal
+          title="全书体检"
+          message={(
+            <div className={s.col}>
+              <div>对已定稿章节逐章做跨章一致性快检：人设冲突、时间线、情节矛盾、伏笔回收与文风漂移，只报告问题，不改动正文。</div>
+              <div className={s.tiny}>每章调用一次审稿模型，章数多时耗时较长，可随时停止；体检为只读操作，不影响正文、设定与记忆。</div>
+            </div>
+          )}
+          confirmText="开始体检"
+          onConfirm={() => { setInspectConfirm(false); startInspect() }}
+          onCancel={() => setInspectConfirm(false)}
+        />
+      )}
+
+      {/* 全书体检报告 */}
+      {inspectReport && (
+        <Modal
+          title="全书体检报告"
+          width={640}
+          onClose={() => setInspectReport(null)}
+          footer={(
+            <div className={s.row}>
+              <span className={s.spacer} />
+              <button className={s.btnPrimary} onClick={() => setInspectReport(null)}>关闭</button>
+            </div>
+          )}
+        >
+          {staleFores.length > 0 && (
+            <div className={s.runBox}>
+              <div>伏笔账提醒：以下伏笔已超过建议回收章号仍未回收</div>
+              {staleFores.map((f, i) => (
+                <div key={i} className={s.tiny}>· 第 {f.plantedAt} 章埋下：{f.desc}{f.suggestPayoffAt != null ? `（建议第 ${f.suggestPayoffAt} 章前后回收）` : ''}</div>
+              ))}
+            </div>
+          )}
+          {inspectReport.length === 0 && staleFores.length === 0 ? (
+            <div className={s.hint}>未发现问题。</div>
+          ) : inspectReport.map(g => (
+            <div key={g.no} className={s.col}>
+              <div>第 {g.no} 章（{g.issues.length} 个问题）</div>
+              {g.issues.map((it, i) => (
+                <div key={i} className={s.row}>
+                  <span className={`${s.tag} ${it.severity === 'high' ? s.tagDanger : it.severity === 'mid' ? s.tagWarn : ''}`}>
+                    {INSPECT_SEVERITY_LABEL[it.severity]}·{INSPECT_TYPE_LABEL[it.type]}
+                  </span>
+                  <div className={s.grow}>
+                    <div>{it.message}</div>
+                    {it.evidence && <div className={s.tiny}>原文：「{it.evidence}」</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))}
+        </Modal>
       )}
 
       {/* 续排/开新卷：生成中 */}
